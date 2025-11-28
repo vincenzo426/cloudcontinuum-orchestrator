@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - orchestrator.cloudcontinuum.io
+  resources:
+  - placementrequests
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - orchestrator.cloudcontinuum.io
+  resources:
+  - placementrequests/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - orchestrator.cloudcontinuum.io
+  resources:
+  - placementrequests/status
+  verbs:
+  - get
+  - patch
+  - update

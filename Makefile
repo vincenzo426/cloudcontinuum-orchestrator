@@ -1,225 +1,250 @@
-################################################################################
-# Makefile - Utility per Multi-Cluster Kubernetes con Submariner
-################################################################################
-# Descrizione: Comandi rapidi per controllo e verifica cluster
-################################################################################
+# Image URL to use all building/pushing image targets
+IMG ?= controller:latest
+
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
+endif
+
+# CONTAINER_TOOL defines the container tool to be used for building images.
+# Be aware that the target commands are only tested with Docker which is
+# scaffolded by default. However, you might want to replace it to use other
+# tools. (i.e. podman)
+CONTAINER_TOOL ?= docker
+
+# Setting SHELL to bash allows bash commands to be executed by recipes.
+# Options are set to exit when a recipe line exits non-zero or a piped command fails.
+SHELL = /usr/bin/env bash -o pipefail
+.SHELLFLAGS = -ec
+
+.PHONY: all
+all: build
+
+##@ General
+
+# The help target prints out all targets with their descriptions organized
+# beneath their categories. The categories are represented by '##@' and the
+# target descriptions by '##'. The awk command is responsible for reading the
+# entire set of makefiles included in this invocation, looking for lines of the
+# file as xyz: ## something, and then pretty-format the target and help. Then,
+# if there's a line with ##@ something, that gets pretty-printed as a category.
+# More info on the usage of ANSI control characters for terminal formatting:
+# https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters
+# More info on the awk command:
+# http://linuxcommand.org/lc3_adv_awk.php
 
 .PHONY: help
+help: ## Display this help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-# Colori per output
-GREEN  := \033[0;32m
-YELLOW := \033[1;33m
-RED    := \033[0;31m
-BLUE   := \033[0;34m
-NC     := \033[0m
+##@ Development
 
-################################################################################
-# CONFIGURAZIONE
-################################################################################
+.PHONY: manifests
+manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
-CLOUD := cloud_cluster
-EDGE1 := edge_cluster_1
-EDGE2 := edge_cluster_2
+.PHONY: generate
+generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
-CLOUD_IP := 192.168.151.94
-EDGE1_IP := 192.168.151.81
-EDGE2_IP := 192.168.151.82
+.PHONY: fmt
+fmt: ## Run go fmt against code.
+	go fmt ./...
 
-################################################################################
-# HELP
-################################################################################
+.PHONY: vet
+vet: ## Run go vet against code.
+	go vet ./...
 
-help: ## Mostra questo help
-	@echo "$(BLUE)╔══════════════════════════════════════════════╗$(NC)"
-	@echo "$(BLUE)║    Utility Multi-Cluster + Submariner       ║$(NC)"
-	@echo "$(BLUE)╚══════════════════════════════════════════════╝$(NC)"
-	@echo ""
-	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*?##/ { printf "  $(YELLOW)%-20s$(NC) %s\n", $$1, $$2 } /^##@/ { printf "\n$(GREEN)%s$(NC)\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
-	@echo ""
+.PHONY: test
+test: manifests generate fmt vet setup-envtest ## Run tests.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-################################################################################
-##@ 📍 Verifica Cluster
-################################################################################
+# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
+# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
+# CertManager is installed by default; skip with:
+# - CERT_MANAGER_INSTALL_SKIP=true
+KIND_CLUSTER ?= cloudcontinuum-orchestrator-test-e2e
 
-nodes: ## Mostra nodi di tutti i cluster
-	@echo "$(GREEN)Cloud:$(NC)"
-	@kubectl get nodes -o wide --context=$(CLOUD)
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get nodes -o wide --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get nodes -o wide --context=$(EDGE2)
+.PHONY: setup-test-e2e
+setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+	@command -v $(KIND) >/dev/null 2>&1 || { \
+		echo "Kind is not installed. Please install Kind manually."; \
+		exit 1; \
+	}
+	@case "$$($(KIND) get clusters)" in \
+		*"$(KIND_CLUSTER)"*) \
+			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+		*) \
+			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+	esac
 
-pods: ## Mostra pod su tutti i cluster
-	@echo "$(GREEN)Cloud:$(NC)"
-	@kubectl get pods -A --context=$(CLOUD)
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get pods -A --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get pods -A --context=$(EDGE2)
+.PHONY: test-e2e
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	$(MAKE) cleanup-test-e2e
 
-ns: ## Mostra namespace su tutti i cluster
-	@echo "$(GREEN)Cloud:$(NC)"
-	@kubectl get ns --context=$(CLOUD)
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get ns --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get ns --context=$(EDGE2)
+.PHONY: cleanup-test-e2e
+cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
+	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
-################################################################################
-##@ 🌊 Submariner
-################################################################################
+.PHONY: lint
+lint: golangci-lint ## Run golangci-lint linter
+	"$(GOLANGCI_LINT)" run
 
-sub-pods: ## Mostra pod Submariner
-	@echo "$(GREEN)Cloud:$(NC)"
-	@kubectl get pods -n submariner-operator --context=$(CLOUD)
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get pods -n submariner-operator --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get pods -n submariner-operator --context=$(EDGE2)
+.PHONY: lint-fix
+lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
+	"$(GOLANGCI_LINT)" run --fix
 
-sub-gw: ## Mostra gateway Submariner
-	@echo "$(GREEN)Cloud:$(NC)"
-	@subctl show gateways --context=$(CLOUD)
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@subctl show gateways --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@subctl show gateways --context=$(EDGE2)
+.PHONY: lint-config
+lint-config: golangci-lint ## Verify golangci-lint linter configuration
+	"$(GOLANGCI_LINT)" config verify
 
-sub-conn: ## Mostra connessioni cross-cluster
-	@echo "$(GREEN)Dal Cloud:$(NC)"
-	@subctl show connections --context=$(CLOUD)
-	@echo ""
-	@echo "$(GREEN)Da Edge 1:$(NC)"
-	@subctl show connections --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Da Edge 2:$(NC)"
-	@subctl show connections --context=$(EDGE2)
+##@ Build
 
-sub-export: ## Mostra servizi esportati
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get serviceexports -A --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get serviceexports -A --context=$(EDGE2)
+.PHONY: build
+build: manifests generate fmt vet ## Build manager binary.
+	go build -o bin/manager cmd/main.go
 
-sub-import: ## Mostra servizi importati
-	@echo "$(GREEN)Cloud:$(NC)"
-	@kubectl get serviceimports -A --context=$(CLOUD)
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get serviceimports -A --context=$(EDGE1)
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get serviceimports -A --context=$(EDGE2)
+.PHONY: run
+run: manifests generate fmt vet ## Run a controller from your host.
+	go run ./cmd/main.go
 
-sub-endpoints: ## Mostra endpoint sul broker
-	@ subctl show endpoints
+# If you wish to build the manager image targeting other platforms you can use the --platform flag.
+# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
+# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+.PHONY: docker-build
+docker-build: ## Build docker image with the manager.
+	$(CONTAINER_TOOL) build -t ${IMG} .
 
-################################################################################
-##@ 🔍 Logs e Debug
-################################################################################
+.PHONY: docker-push
+docker-push: ## Push docker image with the manager.
+	$(CONTAINER_TOOL) push ${IMG}
 
-logs-operator: ## Log operator Submariner (make logs-operator CTX=cloud_cluster)
-	@kubectl logs -n submariner-operator -l name=submariner-operator --context=$(CTX) --tail=50
+# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
+# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
+# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
+# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
+# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
+PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+.PHONY: docker-buildx
+docker-buildx: ## Build and push docker image for the manager for cross-platform support
+	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+	- $(CONTAINER_TOOL) buildx create --name cloudcontinuum-orchestrator-builder
+	$(CONTAINER_TOOL) buildx use cloudcontinuum-orchestrator-builder
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx rm cloudcontinuum-orchestrator-builder
+	rm Dockerfile.cross
 
-logs-gateway: ## Log gateway Submariner (make logs-gateway CTX=cloud_cluster)
-	@kubectl logs -n submariner-operator -l app=submariner-gateway --context=$(CTX) --tail=50
+.PHONY: build-installer
+build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+	mkdir -p dist
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
+	"$(KUSTOMIZE)" build config/default > dist/install.yaml
 
-logs-lighthouse: ## Log lighthouse agent (make logs-lighthouse CTX=cloud_cluster)
-	@kubectl logs -n submariner-operator -l component=submariner-lighthouse-agent --context=$(CTX) --tail=50
+##@ Deployment
 
-events-sub: ## Eventi namespace submariner-operator
-	@echo "$(GREEN)Cloud:$(NC)"
-	@kubectl get events -n submariner-operator --context=$(CLOUD) --sort-by='.lastTimestamp' | tail -10
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get events -n submariner-operator --context=$(EDGE1) --sort-by='.lastTimestamp' | tail -10
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get events -n submariner-operator --context=$(EDGE2) --sort-by='.lastTimestamp' | tail -10
+ifndef ignore-not-found
+  ignore-not-found = false
+endif
 
-################################################################################
-##@ 🧪 Test
-################################################################################
+.PHONY: install
+install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
+	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" apply -f -; else echo "No CRDs to install; skipping."; fi
 
-ping: ## Ping tutte le VM
-	@echo "$(YELLOW)Cloud ($(CLOUD_IP)):$(NC)"
-	@ping -c 2 $(CLOUD_IP) && echo "$(GREEN)✅ OK$(NC)" || echo "$(RED)❌ FAIL$(NC)"
-	@echo ""
-	@echo "$(YELLOW)Edge 1 ($(EDGE1_IP)):$(NC)"
-	@ping -c 2 $(EDGE1_IP) && echo "$(GREEN)✅ OK$(NC)" || echo "$(RED)❌ FAIL$(NC)"
-	@echo ""
-	@echo "$(YELLOW)Edge 2 ($(EDGE2_IP)):$(NC)"
-	@ping -c 2 $(EDGE2_IP) && echo "$(GREEN)✅ OK$(NC)" || echo "$(RED)❌ FAIL$(NC)"
+.PHONY: uninstall
+uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
+	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
-test-dns: ## Test DNS multicluster (richiede servizio nginx-test)
-	@kubectl run test-dns --rm -i --image=busybox --restart=Never --context=$(CLOUD) -- \
-		nslookup nginx-test.test-submariner.svc.clusterset.local.
+.PHONY: deploy
+deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
+	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
 
-test-curl: ## Test curl cross-cluster (richiede servizio nginx-test)
-	@kubectl run test-curl --rm -i --image=curlimages/curl --restart=Never --context=$(CLOUD) -- \
-		curl -s nginx-test.test-submariner.svc.clusterset.local
+.PHONY: undeploy
+undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
-################################################################################
-##@ 🔧 Utility
-################################################################################
+##@ Dependencies
 
-ctx: ## Lista context disponibili
-	@kubectl config get-contexts
+## Location to install dependencies to
+LOCALBIN ?= $(shell pwd)/bin
+$(LOCALBIN):
+	mkdir -p "$(LOCALBIN)"
 
-switch-cloud: ## Switch a cloud_cluster
-	@kubectl config use-context $(CLOUD)
-	@echo "$(GREEN)✅ Context: $(CLOUD)$(NC)"
+## Tool Binaries
+KUBECTL ?= kubectl
+KIND ?= kind
+KUSTOMIZE ?= $(LOCALBIN)/kustomize
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+ENVTEST ?= $(LOCALBIN)/setup-envtest
+GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 
-switch-edge1: ## Switch a edge_cluster_1
-	@kubectl config use-context $(EDGE1)
-	@echo "$(GREEN)✅ Context: $(EDGE1)$(NC)"
+## Tool Versions
+KUSTOMIZE_VERSION ?= v5.7.1
+CONTROLLER_TOOLS_VERSION ?= v0.19.0
 
-switch-edge2: ## Switch a edge_cluster_2
-	@kubectl config use-context $(EDGE2)
-	@echo "$(GREEN)✅ Context: $(EDGE2)$(NC)"
+#ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
+ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
+  [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
+  printf '%s\n' "$$v" | sed -E 's/^v?([0-9]+)\.([0-9]+).*/release-\1.\2/')
 
-ssh-cloud: ## SSH a cloud cluster
-	@ssh user@$(CLOUD_IP)
+#ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
+ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
+  [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
+  printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
-ssh-edge1: ## SSH a edge 1
-	@ssh user@$(EDGE1_IP)
+GOLANGCI_LINT_VERSION ?= v2.5.0
+.PHONY: kustomize
+kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
+$(KUSTOMIZE): $(LOCALBIN)
+	$(call go-install-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v5,$(KUSTOMIZE_VERSION))
 
-ssh-edge2: ## SSH a edge 2
-	@ssh user@$(EDGE2_IP)
+.PHONY: controller-gen
+controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
+$(CONTROLLER_GEN): $(LOCALBIN)
+	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
 
-coredns-config: ## Mostra config CoreDNS
-	@echo "$(GREEN)Cloud:$(NC)"
-	@kubectl get configmap coredns -n kube-system --context=$(CLOUD) -o yaml | grep -A 5 "clusterset.local" || echo "$(RED)Non configurato$(NC)"
-	@echo ""
-	@echo "$(GREEN)Edge 1:$(NC)"
-	@kubectl get configmap coredns -n kube-system --context=$(EDGE1) -o yaml | grep -A 5 "clusterset.local" || echo "$(RED)Non configurato$(NC)"
-	@echo ""
-	@echo "$(GREEN)Edge 2:$(NC)"
-	@kubectl get configmap coredns -n kube-system --context=$(EDGE2) -o yaml | grep -A 5 "clusterset.local"
+.PHONY: setup-envtest
+setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
+	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
+	@"$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path || { \
+		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
+		exit 1; \
+	}
 
-edge2-status: ## Status risorse edge2
-	@echo "$(YELLOW)Tentativo connessione edge2...$(NC)"
-	@ssh -o ConnectTimeout=3 user@$(EDGE2_IP) 'bash -s' << 'EOF' 2>/dev/null || echo "$(RED)❌ Connessione fallita$(NC)"
-		echo "Memoria: $$(free -h | grep Mem | awk '{print $$3"/"$$2}')"
-		echo "CPU Load: $$(uptime | awk -F'load average:' '{print $$2}')"
-		echo "Disco: $$(df -h / | tail -1 | awk '{print $$5}')"
-	EOF
+.PHONY: envtest
+envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
+$(ENVTEST): $(LOCALBIN)
+	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
 
-edge1-status: ## Status risorse edge2
-	@echo "$(YELLOW)Tentativo connessione edge2...$(NC)"
-	@ssh -o ConnectTimeout=3 user@$(EDGE1_IP) 'bash -s' << 'EOF' 2>/dev/null || echo "$(RED)❌ Connessione fallita$(NC)"
-		echo "Memoria: $$(free -h | grep Mem | awk '{print $$3"/"$$2}')"
-		echo "CPU Load: $$(uptime | awk -F'load average:' '{print $$2}')"
-		echo "Disco: $$(df -h / | tail -1 | awk '{print $$5}')"
-	EOF
+.PHONY: golangci-lint
+golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
+$(GOLANGCI_LINT): $(LOCALBIN)
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
+# $1 - target path with name of binary
+# $2 - package url which can be installed
+# $3 - specific version of package
+define go-install-tool
+@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+echo "Downloading $${package}" ;\
+rm -f "$(1)" ;\
+GOBIN="$(LOCALBIN)" go install $${package} ;\
+mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
+} ;\
+ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
+endef
+
+define gomodver
+$(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
+endef

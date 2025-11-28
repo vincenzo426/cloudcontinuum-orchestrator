@@ -1,0 +1,9 @@
+apiVersion: orchestrator.cloudcontinuum.io/v1alpha1
+kind: PlacementRequest
+metadata:
+  labels:
+    app.kubernetes.io/name: cloudcontinuum-orchestrator
+    app.kubernetes.io/managed-by: kustomize
+  name: placementrequest-sample
+spec:
+  # TODO(user): Add fields here
