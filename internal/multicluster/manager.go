@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"  // <-- AGGIUNGI QUESTA RIGA
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -21,7 +22,7 @@ type ClusterManager struct {
 }
 
 // NewClusterManager creates a new ClusterManager by loading kubeconfigs from a Secret
-func NewClusterManager(ctx context.Context, localClient client.Client, secretName, secretNamespace string, scheme *rest.Scheme) (*ClusterManager, error) {
+func NewClusterManager(ctx context.Context, localClient client.Client, secretName, secretNamespace string, scheme *runtime.Scheme) (*ClusterManager, error) {
 	cm := &ClusterManager{
 		LocalClient:    localClient,
 		ClusterClients: make(map[string]client.Client),
