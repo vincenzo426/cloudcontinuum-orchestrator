@@ -53,6 +53,7 @@ type PlacementRequestReconciler struct {
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=placementrequests/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch  // <-- AGGIUNGI QUESTA RIGA
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *PlacementRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -338,7 +339,7 @@ func (r *PlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	ctx := context.Background()
 	clusterManager, err := multicluster.NewClusterManager(
 		ctx,
-		mgr.GetClient(),
+		mgr.GetConfig(), // <-- USA GetConfig() invece di GetClient()
 		"cluster-kubeconfigs",
 		"cloudcontinuum-system",
 		mgr.GetScheme(),

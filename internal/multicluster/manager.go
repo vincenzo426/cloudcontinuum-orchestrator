@@ -7,30 +7,34 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime" // <-- AGGIUNGI QUESTA RIGA
 	"k8s.io/apimachinery/pkg/types"
-	//"k8s.io/client-go/rest"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // ClusterManager manages connections to multiple clusters
 type ClusterManager struct {
-	// LocalClient is the client for the cluster where controller runs
-	LocalClient client.Client
-
 	// ClusterClients maps cluster names to their respective clients
 	ClusterClients map[string]client.Client
 }
 
 // NewClusterManager creates a new ClusterManager by loading kubeconfigs from a Secret
-func NewClusterManager(ctx context.Context, localClient client.Client, secretName, secretNamespace string, scheme *runtime.Scheme) (*ClusterManager, error) {
+// NewClusterManager creates a new ClusterManager by loading kubeconfigs from a Secret
+// NewClusterManager creates a new ClusterManager by loading kubeconfigs from a Secret
+func NewClusterManager(ctx context.Context, config *rest.Config, secretName, secretNamespace string, scheme *runtime.Scheme) (*ClusterManager, error) {
 	cm := &ClusterManager{
-		LocalClient:    localClient,
 		ClusterClients: make(map[string]client.Client),
+	}
+
+	// Create a direct (non-cached) client to read the Secret
+	directClient, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create direct client: %w", err)
 	}
 
 	// Fetch the Secret containing kubeconfigs
 	secret := &corev1.Secret{}
-	if err := localClient.Get(ctx, types.NamespacedName{
+	if err := directClient.Get(ctx, types.NamespacedName{
 		Name:      secretName,
 		Namespace: secretNamespace,
 	}, secret); err != nil {
@@ -39,14 +43,42 @@ func NewClusterManager(ctx context.Context, localClient client.Client, secretNam
 
 	// For each kubeconfig in the Secret, create a client
 	for clusterName, kubeconfigData := range secret.Data {
-		// Parse kubeconfig YAML into rest.Config
-		config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
+		// Load the kubeconfig
+		kubeconfig, err := clientcmd.Load(kubeconfigData)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse kubeconfig for cluster %s: %w", clusterName, err)
+			return nil, fmt.Errorf("failed to load kubeconfig for cluster %s: %w", clusterName, err)
+		}
+
+		// Determine which context to use
+		contextName := kubeconfig.CurrentContext
+		if contextName == "" {
+			// If no current context, use the first available
+			for name := range kubeconfig.Contexts {
+				contextName = name
+				break
+			}
+		}
+
+		if contextName == "" {
+			return nil, fmt.Errorf("no context found in kubeconfig for cluster %s", clusterName)
+		}
+
+		// Build client config from the kubeconfig
+		clientConfig := clientcmd.NewNonInteractiveClientConfig(
+			*kubeconfig,
+			contextName,
+			&clientcmd.ConfigOverrides{},
+			nil,
+		)
+
+		// Get the rest.Config
+		clusterConfig, err := clientConfig.ClientConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create client config for cluster %s (context: %s): %w", clusterName, contextName, err)
 		}
 
 		// Create Kubernetes client
-		clusterClient, err := client.New(config, client.Options{Scheme: scheme})
+		clusterClient, err := client.New(clusterConfig, client.Options{Scheme: scheme})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create client for cluster %s: %w", clusterName, err)
 		}

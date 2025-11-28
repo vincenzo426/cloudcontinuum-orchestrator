@@ -25,6 +25,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch  // <-- AGGIUNGI QUESTA RIGA
+- apiGroups:
   - orchestrator.cloudcontinuum.io
   resources:
   - placementrequests
