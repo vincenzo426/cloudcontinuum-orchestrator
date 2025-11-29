@@ -34,6 +34,7 @@ import (
 	orchestratorv1alpha1 "github.com/vincenzo426/cloudcontinuum-orchestrator/api/v1alpha1"
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/multicluster"
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/placement"
+	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/metrics"
 )
 
 // PlacementRequestReconciler reconciles a PlacementRequest object
@@ -46,6 +47,9 @@ type PlacementRequestReconciler struct {
 
 	// Multi-cluster manager
 	ClusterManager *multicluster.ClusterManager
+
+	// Metrics collector
+    MetricsCollector metrics.Collector
 }
 
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=placementrequests,verbs=get;list;watch;create;update;patch;delete
@@ -122,67 +126,72 @@ func (r *PlacementRequestReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return ctrl.Result{}, nil
 }
 
-// collectMetrics gathers metrics from all clusters
+// collectMetrics raccoglie metriche reali dai cluster
 func (r *PlacementRequestReconciler) collectMetrics(ctx context.Context) (*placement.ClusterMetrics, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("Collecting cluster metrics")
+    logger := log.FromContext(ctx)
+    
+    // Usa il MetricsCollector per ottenere metriche reali
+    metrics, err := r.MetricsCollector.CollectMetrics(ctx)
+    if err != nil {
+        logger.Error(err, "Failed to collect real metrics, using fallback")
+        // Fallback su metriche mock solo in caso di errore critico
+        return r.collectMockMetrics(ctx), nil
+    }
+    
+    logger.V(1).Info("Real metrics collected", "clusters", len(metrics.Clusters))
+    return metrics, nil
+}
 
-	metrics := placement.NewClusterMetrics()
-
-	// TODO: Replace with real metrics from clusters
-	// For now, use mock data
-
-	// Edge Cluster 1 (Imola)
-	metrics.SetCluster("edge_cluster_1", &placement.ClusterMetric{
-		Name:            "edge_cluster_1",
-		CPUCapacity:     4000,                   // 4 cores
-		CPUUsed:         1000,                   // 1 core used
-		CPUAvailable:    3000,                   // 3 cores available
-		MemoryCapacity:  8 * 1024 * 1024 * 1024, // 8Gi
-		MemoryUsed:      2 * 1024 * 1024 * 1024, // 2Gi
-		MemoryAvailable: 6 * 1024 * 1024 * 1024, // 6Gi
-		LatencyToEdge1:  0,
-		LatencyToEdge2:  15, // 15ms to edge2
-		LatencyToCloud:  30, // 30ms to cloud
-		Available:       true,
-	})
-
-	// Edge Cluster 2 (Lugo)
-	metrics.SetCluster("edge_cluster_2", &placement.ClusterMetric{
-		Name:            "edge_cluster_2",
-		CPUCapacity:     4000,
-		CPUUsed:         1500,
-		CPUAvailable:    2500,
-		MemoryCapacity:  8 * 1024 * 1024 * 1024,
-		MemoryUsed:      3 * 1024 * 1024 * 1024,
-		MemoryAvailable: 5 * 1024 * 1024 * 1024,
-		LatencyToEdge1:  15,
-		LatencyToEdge2:  0,
-		LatencyToCloud:  25,
-		Available:       true,
-	})
-
-	// Cloud Cluster (Bologna)
-	metrics.SetCluster("cloud_cluster", &placement.ClusterMetric{
-		Name:            "cloud_cluster",
-		CPUCapacity:     16000, // 16 cores
-		CPUUsed:         4000,
-		CPUAvailable:    12000,
-		MemoryCapacity:  32 * 1024 * 1024 * 1024, // 32Gi
-		MemoryUsed:      8 * 1024 * 1024 * 1024,
-		MemoryAvailable: 24 * 1024 * 1024 * 1024,
-		LatencyToEdge1:  30,
-		LatencyToEdge2:  25,
-		LatencyToCloud:  0,
-		Available:       true,
-	})
-
-	logger.Info("Metrics collected",
-		"edge1_available_cpu", metrics.GetCluster("edge_cluster_1").CPUAvailable,
-		"edge2_available_cpu", metrics.GetCluster("edge_cluster_2").CPUAvailable,
-		"cloud_available_cpu", metrics.GetCluster("cloud_cluster").CPUAvailable)
-
-	return metrics, nil
+// collectMockMetrics fornisce metriche di fallback (manteniamo per sicurezza)
+func (r *PlacementRequestReconciler) collectMockMetrics(ctx context.Context) *placement.ClusterMetrics {
+    metrics := placement.NewClusterMetrics()
+    
+    // Edge Cluster 1
+    metrics.SetCluster("edge_cluster_1", &placement.ClusterMetric{
+        Name:            "edge_cluster_1",
+        CPUCapacity:     4000,
+        CPUUsed:         1000,
+        CPUAvailable:    3000,
+        MemoryCapacity:  8 * 1024 * 1024 * 1024,
+        MemoryUsed:      2 * 1024 * 1024 * 1024,
+        MemoryAvailable: 6 * 1024 * 1024 * 1024,
+        LatencyToEdge1:  0,
+        LatencyToEdge2:  15,
+        LatencyToCloud:  30,
+        Available:       true,
+    })
+    
+    // Edge Cluster 2
+    metrics.SetCluster("edge_cluster_2", &placement.ClusterMetric{
+        Name:            "edge_cluster_2",
+        CPUCapacity:     4000,
+        CPUUsed:         1500,
+        CPUAvailable:    2500,
+        MemoryCapacity:  8 * 1024 * 1024 * 1024,
+        MemoryUsed:      3 * 1024 * 1024 * 1024,
+        MemoryAvailable: 5 * 1024 * 1024 * 1024,
+        LatencyToEdge1:  15,
+        LatencyToEdge2:  0,
+        LatencyToCloud:  25,
+        Available:       true,
+    })
+    
+    // Cloud Cluster
+    metrics.SetCluster("cloud_cluster", &placement.ClusterMetric{
+        Name:            "cloud_cluster",
+        CPUCapacity:     16000,
+        CPUUsed:         4000,
+        CPUAvailable:    12000,
+        MemoryCapacity:  32 * 1024 * 1024 * 1024,
+        MemoryUsed:      8 * 1024 * 1024 * 1024,
+        MemoryAvailable: 24 * 1024 * 1024 * 1024,
+        LatencyToEdge1:  30,
+        LatencyToEdge2:  25,
+        LatencyToCloud:  0,
+        Available:       true,
+    })
+    
+    return metrics
 }
 
 // createPod creates a pod on the target cluster
@@ -328,6 +337,7 @@ func (r *PlacementRequestReconciler) updateStatus(ctx context.Context, pr *orche
 // SetupWithManager sets up the controller with the Manager
 // SetupWithManager sets up the controller with the Manager
 func (r *PlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	
 	// Initialize strategies
 	r.strategies = map[string]placement.Strategy{
 		"cloud-only":       placement.NewCloudOnlyStrategy(),
@@ -348,6 +358,16 @@ func (r *PlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed to initialize cluster manager: %w", err)
 	}
 	r.ClusterManager = clusterManager
+
+	// Initialize real metrics collector
+    metricsCollector := metrics.NewRealMetricsCollector(
+        clusterManager.ClusterClients,
+        metrics.DefaultConfig(),
+    )
+    r.MetricsCollector = metricsCollector
+    
+    // Start background metrics refresh
+    metricsCollector.Start(ctx)
 
 	// Log configured clusters
 	ctrl.Log.Info("Multi-cluster manager initialized", "clusters", clusterManager.ListClusters())
