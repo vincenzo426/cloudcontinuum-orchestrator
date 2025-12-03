@@ -5,10 +5,12 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime" // <-- AGGIUNGI QUESTA RIGA
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -77,13 +79,27 @@ func NewClusterManager(ctx context.Context, config *rest.Config, secretName, sec
 			return nil, fmt.Errorf("failed to create client config for cluster %s (context: %s): %w", clusterName, contextName, err)
 		}
 
-		// Create Kubernetes client
-		clusterClient, err := client.New(clusterConfig, client.Options{Scheme: scheme})
+		// Create a new scheme with all necessary types
+		clusterScheme := runtime.NewScheme()
+
+		// Register standard Kubernetes types (Pod, Namespace, etc.)
+		if err := clientgoscheme.AddToScheme(clusterScheme); err != nil {
+			return nil, fmt.Errorf("failed to add Kubernetes scheme for cluster %s: %w", clusterName, err)
+		}
+
+		// Register metrics types (NodeMetrics, PodMetrics)
+		if err := metricsv1beta1.AddToScheme(clusterScheme); err != nil {
+			return nil, fmt.Errorf("failed to add metrics scheme for cluster %s: %w", clusterName, err)
+		}
+
+		// Create Kubernetes client with complete scheme
+		clusterClient, err := client.New(clusterConfig, client.Options{Scheme: clusterScheme})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create client for cluster %s: %w", clusterName, err)
 		}
 
 		cm.ClusterClients[clusterName] = clusterClient
+
 	}
 
 	return cm, nil
