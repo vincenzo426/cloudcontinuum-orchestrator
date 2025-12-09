@@ -252,7 +252,7 @@ func (c *RealMetricsCollector) measureLatencies(ctx context.Context, metrics *pl
 	logger := log.FromContext(ctx)
 
 	// Per ogni coppia di cluster, misura latenza
-	clusterNames := []string{"cloud_cluster", "edge_cluster_1", "edge_cluster_2"}
+	clusterNames := []string{"cloud_cluster", "edge_cluster_1", "edge_cluster_2,", "edge_cluster_3"}
 
 	for _, fromCluster := range clusterNames {
 		fromMetric := metrics.GetCluster(fromCluster)

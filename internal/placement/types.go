@@ -36,6 +36,7 @@ type ClusterMetric struct {
 	// Latency to other clusters (in milliseconds)
 	LatencyToEdge1 int64
 	LatencyToEdge2 int64
+	LatencyToEdge3 int64
 	LatencyToCloud int64
 
 	// Availability

@@ -57,6 +57,7 @@ spec:
                 enum:
                 - edge_cluster_1
                 - edge_cluster_2
+                - edge_cluster_3
                 - cloud_cluster
                 - none
                 type: string

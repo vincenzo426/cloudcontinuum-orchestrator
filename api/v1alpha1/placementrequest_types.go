@@ -32,7 +32,7 @@ type PlacementRequestSpec struct {
 	ResourceRequirements ResourceRequirements `json:"resourceRequirements"`
 
 	// DataLocation specifies where the data resides
-	// +kubebuilder:validation:Enum=edge_cluster_1;edge_cluster_2;cloud_cluster;none
+	// +kubebuilder:validation:Enum=edge_cluster_1;edge_cluster_2;edge_cluster_3;cloud_cluster;none
 	// +optional
 	DataLocation string `json:"dataLocation,omitempty"`
 

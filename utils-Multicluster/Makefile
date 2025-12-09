@@ -20,10 +20,12 @@ NC     := \033[0m
 CLOUD := cloud_cluster
 EDGE1 := edge_cluster_1
 EDGE2 := edge_cluster_2
+EDGE3 := edge_cluster_3
 
 CLOUD_IP := 192.168.151.94
-EDGE1_IP := 192.168.151.81
-EDGE2_IP := 192.168.151.82
+EDGE1_IP := 192.168.151.181
+EDGE2_IP := 192.168.151.182
+EDGE3_IP := 192.168.151.80
 
 ################################################################################
 # HELP
@@ -94,6 +96,9 @@ sub-gw: ## Mostra gateway Submariner
 	@echo ""
 	@echo "$(GREEN)Edge 2:$(NC)"
 	@subctl show gateways --context=$(EDGE2)
+	@echo ""
+	@echo "$(GREEN)Edge 3:$(NC)"
+	@subctl show gateways --context=$(EDGE3)
 
 sub-conn: ## Mostra connessioni cross-cluster
 	@echo "$(GREEN)Dal Cloud:$(NC)"
@@ -104,6 +109,9 @@ sub-conn: ## Mostra connessioni cross-cluster
 	@echo ""
 	@echo "$(GREEN)Da Edge 2:$(NC)"
 	@subctl show connections --context=$(EDGE2)
+	echo ""
+	@echo "$(GREEN)Da Edge 3:$(NC)"
+	@subctl show connections --context=$(EDGE3)
 
 sub-export: ## Mostra servizi esportati
 	@echo "$(GREEN)Edge 1:$(NC)"
@@ -111,6 +119,9 @@ sub-export: ## Mostra servizi esportati
 	@echo ""
 	@echo "$(GREEN)Edge 2:$(NC)"
 	@kubectl get serviceexports -A --context=$(EDGE2)
+	@echo ""
+	@echo "$(GREEN)Edge 3:$(NC)"
+	@kubectl get serviceexports -A --context=$(EDGE3)
 
 sub-import: ## Mostra servizi importati
 	@echo "$(GREEN)Cloud:$(NC)"
@@ -121,6 +132,9 @@ sub-import: ## Mostra servizi importati
 	@echo ""
 	@echo "$(GREEN)Edge 2:$(NC)"
 	@kubectl get serviceimports -A --context=$(EDGE2)
+	@echo ""
+	@echo "$(GREEN)Edge 3:$(NC)"
+	@kubectl get serviceimports -A --context=$(EDGE3)
 
 sub-endpoints: ## Mostra endpoint sul broker
 	@ subctl show endpoints
@@ -168,7 +182,7 @@ test-dns: ## Test DNS multicluster (richiede servizio nginx-test)
 
 test-curl: ## Test curl cross-cluster (richiede servizio nginx-test)
 	@kubectl run test-curl --rm -i --image=curlimages/curl --restart=Never --context=$(CLOUD) -- \
-		curl -s nginx-test.test-submariner.svc.clusterset.local
+		curl -s nginx-test.test-submariner.svc.clusterset.local.
 
 ################################################################################
 ##@ 🔧 Utility
@@ -189,6 +203,10 @@ switch-edge2: ## Switch a edge_cluster_2
 	@kubectl config use-context $(EDGE2)
 	@echo "$(GREEN)✅ Context: $(EDGE2)$(NC)"
 
+switch-edge3: ## Switch a edge_cluster_3
+	@kubectl config use-context $(EDGE3)
+	@echo "$(GREEN)✅ Context: $(EDGE3)$(NC)"
+
 ssh-cloud: ## SSH a cloud cluster
 	@ssh user@$(CLOUD_IP)
 
@@ -197,6 +215,9 @@ ssh-edge1: ## SSH a edge 1
 
 ssh-edge2: ## SSH a edge 2
 	@ssh user@$(EDGE2_IP)
+
+ssh-edge3: ## SSH a edge 3
+	@ssh user@$(EDGE3_IP)
 
 coredns-config: ## Mostra config CoreDNS
 	@echo "$(GREEN)Cloud:$(NC)"
@@ -216,7 +237,7 @@ edge2-status: ## Status risorse edge2
 		echo "Disco: $$(df -h / | tail -1 | awk '{print $$5}')"
 	EOF
 
-edge1-status: ## Status risorse edge2
+edge1-status: ## Status risorse edge1
 	@echo "$(YELLOW)Tentativo connessione edge2...$(NC)"
 	@ssh -o ConnectTimeout=3 user@$(EDGE1_IP) 'bash -s' << 'EOF' 2>/dev/null || echo "$(RED)❌ Connessione fallita$(NC)"
 		echo "Memoria: $$(free -h | grep Mem | awk '{print $$3"/"$$2}')"
