@@ -19,3 +19,12 @@ resources:
   path: github.com/vincenzo426/cloudcontinuum-orchestrator/api/v1alpha1
   version: v1alpha1
 version: "3"
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: cloudcontinuum.io
+  group: orchestrator
+  kind: PipelinePlacementRequest
+  path: github.com/vincenzo426/cloudcontinuum-orchestrator/api/v1alpha1
+  version: v1alpha1

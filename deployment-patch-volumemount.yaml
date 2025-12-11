@@ -1,0 +1,14 @@
+spec:
+  template:
+    spec:
+      volumes:
+      - name: kubeflow-token
+        secret:
+          secretName: kubeflow-api-token
+          optional: false
+      containers:
+      - name: manager
+        volumeMounts:
+        - name: kubeflow-token
+          mountPath: /var/run/secrets/kubeflow
+          readOnly: true
