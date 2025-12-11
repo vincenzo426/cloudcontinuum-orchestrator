@@ -7,93 +7,24 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"os"
-	"strings"
 	"time"
 )
 
 // Client wraps HTTP calls to Kubeflow Pipelines API
 type Client struct {
-	BaseURL             string
-	Namespace           string
-	UserEmail           string // User email for multi-user authentication
-	ServiceAccountToken string // Kubernetes ServiceAccount token for auth
-	HTTPClient          *http.Client
+	BaseURL    string
+	Namespace  string
+	HTTPClient *http.Client
 }
 
-// NewClient creates a new Kubeflow client
+// NewClient creates a new Kubeflow client without authentication
 func NewClient(baseURL, namespace string) *Client {
-	// Derive user email from namespace
-	userEmail := namespaceToEmail(namespace)
-
-	// Read ServiceAccount token from pod filesystem
-	token := readServiceAccountToken()
-
 	return &Client{
-		BaseURL:             baseURL,
-		Namespace:           namespace,
-		UserEmail:           userEmail,
-		ServiceAccountToken: token,
+		BaseURL:   baseURL,
+		Namespace: namespace,
 		HTTPClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
-	}
-
-	fmt.Printf("WARN: No ServiceAccount token found, running without authentication\n")
-	return ""
-}
-
-// readServiceAccountToken reads authentication token from the pod filesystem
-// Priority 1: Kubeflow-specific token (mounted as Secret)
-// Priority 2: Standard Kubernetes ServiceAccount token
-// Priority 3: Empty string (for local development)
-func readServiceAccountToken() string {
-	// Try Kubeflow-specific token first (mounted from kubeflow-api-token Secret)
-	tokenPath := "/var/run/secrets/kubeflow/token"
-	tokenBytes, err := os.ReadFile(tokenPath)
-	if err == nil {
-		fmt.Printf("INFO: Using Kubeflow-specific token from %s\n", tokenPath)
-		return strings.TrimSpace(string(tokenBytes))
-	}
-
-	// Fallback to standard ServiceAccount token
-	tokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	tokenBytes, err = os.ReadFile(tokenPath)
-	if err == nil {
-		fmt.Printf("INFO: Using standard ServiceAccount token from %s\n", tokenPath)
-		return strings.TrimSpace(string(tokenBytes))
-	}
-
-	// No token found - will work locally but auth will fail
-	fmt.Printf("WARN: No ServiceAccount token found, running without authentication\n")
-	return ""
-}
-
-// namespaceToEmail converts Kubeflow namespace to user email
-func namespaceToEmail(namespace string) string {
-	// Remove "kubeflow-" prefix if present
-	email := strings.TrimPrefix(namespace, "kubeflow-")
-
-	// Replace hyphens with @ and dots
-	// Example: "user-example-com" -> "user@example.com"
-	parts := strings.Split(email, "-")
-	if len(parts) < 3 {
-		// Fallback: if format doesn't match, use namespace as-is
-		return email + "@example.com"
-	}
-
-	// Reconstruct email: first part + @ + rest with dots
-	return parts[0] + "@" + strings.Replace(strings.Join(parts[1:], "-"), "-", ".", -1)
-}
-
-// addAuthHeaders adds authentication headers required by Kubeflow multi-user mode
-func (c *Client) addAuthHeaders(req *http.Request) {
-	// Add user identity header
-	req.Header.Set("kubeflow-userid", c.UserEmail)
-
-	// Add Kubernetes ServiceAccount token for authentication
-	if c.ServiceAccountToken != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.ServiceAccountToken))
 	}
 }
 
@@ -142,8 +73,6 @@ func (c *Client) UploadPipeline(name string, pipelineYAML []byte) (string, error
 	}
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	c.addAuthHeaders(req) // Add authentication headers
 
 	// Execute request
 	resp, err := c.HTTPClient.Do(req)
@@ -202,9 +131,8 @@ func (c *Client) GetOrCreateExperiment(experimentName string) (string, error) {
 	return c.CreateExperiment(experimentName, fmt.Sprintf("Default experiment for %s", experimentName))
 }
 
-// FindExperimentByName searches for an experiment by name with namespace filtering
+// FindExperimentByName searches for an experiment by name
 func (c *Client) FindExperimentByName(name string) (string, error) {
-	// In multi-user mode, must use resource_reference_key for namespace filtering
 	url := fmt.Sprintf("%s/apis/v1beta1/experiments", c.BaseURL)
 
 	// Add namespace filtering via resource_reference_key
@@ -219,7 +147,6 @@ func (c *Client) FindExperimentByName(name string) (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	c.addAuthHeaders(req) // Add authentication headers
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -248,9 +175,8 @@ func (c *Client) FindExperimentByName(name string) (string, error) {
 	return "", fmt.Errorf("experiment %s not found", name)
 }
 
-// CreateExperiment creates a new experiment with namespace support for multi-user mode
+// CreateExperiment creates a new experiment
 func (c *Client) CreateExperiment(name, description string) (string, error) {
-	// CRITICAL: In multi-user mode, Kubeflow requires resource_references with NAMESPACE
 	reqBody := map[string]interface{}{
 		"name":        name,
 		"description": description,
@@ -277,7 +203,6 @@ func (c *Client) CreateExperiment(name, description string) (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	c.addAuthHeaders(req) // Add authentication headers
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -377,7 +302,6 @@ func (c *Client) CreateRun(pipelineID, runName, experimentID string, parameters 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	c.addAuthHeaders(req) // Add authentication headers
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {

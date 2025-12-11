@@ -1,0 +1,136 @@
+apiVersion: orchestrator.cloudcontinuum.io/v1alpha1
+kind: PipelinePlacementRequest
+metadata:
+  name: simple-request
+  namespace: kubeflow
+spec:
+  pipelineName: "pipeline"
+  placementStrategy: "data-locality-pipeline"
+  dataLocation: "cloud_cluster"
+  # Opzionale: specifica nome experiment di default
+  experimentName: "cloudcontinuum-default"
+  pipelineSource:
+    type: inline  # <--- AGGIUNGI QUESTA RIGA
+    inline: |
+      # PIPELINE DEFINITION
+      # Name: pipeline-con-risorse-custom
+      # Description: Esempio di assegnazione CPU/RAM differenziata per componente
+      components:
+        comp-preprocess-data-op:
+          executorLabel: exec-preprocess-data-op
+          outputDefinitions:
+            parameters:
+              Output:
+                parameterType: STRING
+        comp-train-model-op:
+          executorLabel: exec-train-model-op
+          inputDefinitions:
+            parameters:
+              dataset_path:
+                parameterType: STRING
+      deploymentSpec:
+        executors:
+          exec-preprocess-data-op:
+            container:
+              args:
+              - --executor_input
+              - '{{$}}'
+              - --function_to_execute
+              - preprocess_data_op
+              command:
+              - sh
+              - -c
+              - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+                \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+                \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.5.0'\
+                \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+                $0\" \"$@\"\n"
+              - sh
+              - -ec
+              - 'program_path=$(mktemp -d)
+
+
+                printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+                _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+                '
+              - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+                \ *\n\ndef preprocess_data_op() -> str:\n    import time\n    print(\"Inizio\
+                \ pre-processing dei dati...\")\n    # Simuliamo un lavoro veloce\n    time.sleep(2)\n\
+                \    print(\"Dati puliti e pronti.\")\n    return \"dataset_clean.csv\"\n\
+                \n"
+              image: python:3.7
+              resources:
+                cpuLimit: 0.1
+                cpuRequest: 0.1
+                memoryLimit: 0.536870912
+                memoryRequest: 0.268435456
+          exec-train-model-op:
+            container:
+              args:
+              - --executor_input
+              - '{{$}}'
+              - --function_to_execute
+              - train_model_op
+              command:
+              - sh
+              - -c
+              - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+                \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+                \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.5.0'\
+                \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+                $0\" \"$@\"\n"
+              - sh
+              - -ec
+              - 'program_path=$(mktemp -d)
+
+
+                printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+                _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+                '
+              - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+                \ *\n\ndef train_model_op(dataset_path: str):\n    import time\n    print(f\"\
+                Lettura del dataset da: {dataset_path}\")\n    print(\"Inizio training del\
+                \ modello (simulazione carico pesante)...\")\n\n    # Simuliamo un carico\
+                \ di lavoro pi\xF9 lungo\n    # In un caso reale, qui ci sarebbe codice\
+                \ PyTorch/TensorFlow\n    time.sleep(5)\n\n    print(\"Training completato.\"\
+                )\n\n"
+              image: python:3.7
+              resources:
+                cpuLimit: 0.1
+                cpuRequest: 0.1
+                memoryLimit: 4.294967296
+                memoryRequest: 2.147483648
+      pipelineInfo:
+        description: Esempio di assegnazione CPU/RAM differenziata per componente
+        name: pipeline
+      root:
+        dag:
+          tasks:
+            preprocess-data-op:
+              cachingOptions:
+                enableCache: true
+              componentRef:
+                name: comp-preprocess-data-op
+              taskInfo:
+                name: preprocess-data-op
+            train-model-op:
+              cachingOptions:
+                enableCache: true
+              componentRef:
+                name: comp-train-model-op
+              dependentTasks:
+              - preprocess-data-op
+              inputs:
+                parameters:
+                  dataset_path:
+                    taskOutputParameter:
+                      outputParameterKey: Output
+                      producerTask: preprocess-data-op
+              taskInfo:
+                name: train-model-op
+      schemaVersion: 2.1.0
+      sdkVersion: kfp-2.5.0
