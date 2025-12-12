@@ -4,7 +4,7 @@ metadata:
   name: simple-request
   namespace: kubeflow
 spec:
-  pipelineName: "pipeline-con-risorse-custom-14"
+  pipelineName: "pipeline"
   placementStrategy: "data-locality-pipeline"
   dataLocation: "edge_cluster_2"
   # Opzionale: specifica nome experiment di default
@@ -106,7 +106,7 @@ spec:
                 memoryRequest: 2.147483648
       pipelineInfo:
         description: Esempio di assegnazione CPU/RAM differenziata per componente
-        name: pipeline-con-risorse-custom-14
+        name: pipeline
       root:
         dag:
           tasks:

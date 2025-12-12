@@ -14,18 +14,33 @@ import (
 type Client struct {
 	BaseURL    string
 	Namespace  string
+	Token      string // <--- NUOVO CAMPO
 	HTTPClient *http.Client
 }
 
-// NewClient creates a new Kubeflow client without authentication
-func NewClient(baseURL, namespace string) *Client {
+// NewClient creates a new Kubeflow client with authentication support
+func NewClient(baseURL, namespace, token string) *Client { // <--- FIRMA AGGIORNATA
 	return &Client{
 		BaseURL:   baseURL,
 		Namespace: namespace,
+		Token:     token,
 		HTTPClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
 	}
+}
+
+// Helper per aggiungere l'header di auth
+func (c *Client) addAuth(req *http.Request) {
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+
+	// 2. Aggiungi l'identità utente (FONDAMENTALE per Multi-User Mode)
+	// Questo dice a Kubeflow a quale utente/profilo appartiene la richiesta.
+	// Deve coincidere con il proprietario del namespace target.
+	// Dato che il tuo namespace è 'kubeflow-user-example-com', l'utente di default è:
+	req.Header.Set("kubeflow-userid", "user@example.com")
 }
 
 // ============================================================================
@@ -73,6 +88,7 @@ func (c *Client) UploadPipeline(name string, pipelineYAML []byte) (string, error
 	}
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	c.addAuth(req) // <--- AGGIUNGI AUTH
 
 	// Execute request
 	resp, err := c.HTTPClient.Do(req)
@@ -147,6 +163,7 @@ func (c *Client) FindExperimentByName(name string) (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	c.addAuth(req) // <--- AGGIUNGI AUTH
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -203,6 +220,7 @@ func (c *Client) CreateExperiment(name, description string) (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	c.addAuth(req) // <--- AGGIUNGI AUTH
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -302,6 +320,7 @@ func (c *Client) CreateRun(pipelineID, runName, experimentID string, parameters 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	c.addAuth(req) // <--- AGGIUNGI AUTH
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
