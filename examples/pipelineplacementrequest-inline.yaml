@@ -4,9 +4,9 @@ metadata:
   name: simple-request
   namespace: kubeflow
 spec:
-  pipelineName: "pipeline"
+  pipelineName: "pipeline-prova-edge3"
   placementStrategy: "data-locality-pipeline"
-  dataLocation: "edge_cluster_2"
+  dataLocation: "edge_cluster_3"
   # Opzionale: specifica nome experiment di default
   experimentName: "cloudcontinuum-default"
   pipelineSource:
@@ -62,7 +62,7 @@ spec:
                 \n"
               image: python:3.7
               resources:
-                cpuLimit: 0.2
+                cpuLimit: 0.1
                 cpuRequest: 0.1
                 memoryLimit: 0.536870912
                 memoryRequest: 0.268435456
@@ -100,13 +100,13 @@ spec:
                 )\n\n"
               image: python:3.7
               resources:
-                cpuLimit: 0.2
+                cpuLimit: 0.1
                 cpuRequest: 0.1
                 memoryLimit: 4.294967296
                 memoryRequest: 2.147483648
       pipelineInfo:
         description: Esempio di assegnazione CPU/RAM differenziata per componente
-        name: pipeline
+        name: pipeline-prova-edge3
       root:
         dag:
           tasks:

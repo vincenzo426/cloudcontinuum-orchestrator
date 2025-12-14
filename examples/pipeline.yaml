@@ -1,10 +1,10 @@
 apiVersion: orchestrator.cloudcontinuum.io/v1alpha1
 kind: PipelinePlacementRequest
 metadata:
-  name: simple-request
+  name: cloud-pipeline-request
   namespace: kubeflow
 spec:
-  pipelineName: "pipeline-2"
+  pipelineName: "cloud-pipeline"
   placementStrategy: "data-locality-pipeline"
   dataLocation: "cloud_cluster"
   # Opzionale: specifica nome experiment di default
@@ -60,7 +60,7 @@ spec:
                 \ pre-processing dei dati...\")\n    # Simuliamo un lavoro veloce\n    time.sleep(2)\n\
                 \    print(\"Dati puliti e pronti.\")\n    return \"dataset_clean.csv\"\n\
                 \n"
-              image: python:3.7
+              image: python:3.9
               resources:
                 cpuLimit: 0.1
                 cpuRequest: 0.1
@@ -98,7 +98,7 @@ spec:
                 \ di lavoro pi\xF9 lungo\n    # In un caso reale, qui ci sarebbe codice\
                 \ PyTorch/TensorFlow\n    time.sleep(5)\n\n    print(\"Training completato.\"\
                 )\n\n"
-              image: python:3.7
+              image: python:3.9
               resources:
                 cpuLimit: 0.1
                 cpuRequest: 0.1
@@ -106,7 +106,7 @@ spec:
                 memoryRequest: 2.147483648
       pipelineInfo:
         description: Esempio di assegnazione CPU/RAM differenziata per componente
-        name: pipeline-2
+        name: cloud-pipeline
       root:
         dag:
           tasks:

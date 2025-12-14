@@ -33,3 +33,10 @@ kubectl --context=cloud_cluster logs -f deployment/cloudcontinuum-orchestrator-c
   -n cloudcontinuum-orchestrator-system
 
 kubectl get pipelineplacementrequest simple-request -n kubeflow -o yaml | grep -A 10 status
+
+
+kubectl --context=cloud_cluster set env deployment/ml-pipeline \
+    -n kubeflow KUBEFLOW_ENABLE_AUTHZ=false
+
+kubectl --context=cloud_cluster set env deployment/ml-pipeline-ui \
+    -n kubeflow ENABLE_AUTHZ=false

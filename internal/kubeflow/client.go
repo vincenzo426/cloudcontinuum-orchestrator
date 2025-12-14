@@ -32,15 +32,18 @@ func NewClient(baseURL, namespace, token string) *Client { // <--- FIRMA AGGIORN
 
 // Helper per aggiungere l'header di auth
 func (c *Client) addAuth(req *http.Request) {
-	if c.Token != "" {
+	/*if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 
 	// 2. Aggiungi l'identità utente (FONDAMENTALE per Multi-User Mode)
 	// Questo dice a Kubeflow a quale utente/profilo appartiene la richiesta.
 	// Deve coincidere con il proprietario del namespace target.
-	// Dato che il tuo namespace è 'kubeflow-user-example-com', l'utente di default è:
-	req.Header.Set("kubeflow-userid", "user@example.com")
+	// Dato che il tuo namespace è 'kubeflow-user-example-com', l'utente di default è:*/
+	/*userid := "user@example.com"
+	req.Header.Set("kubeflow-userid", userid)
+	// Log temporaneo per debug
+	fmt.Printf("DEBUG: Setting kubeflow-userid header to: %s for URL: %s\n", userid, req.URL.String())*/
 }
 
 // ============================================================================
@@ -213,6 +216,9 @@ func (c *Client) CreateExperiment(name, description string) (string, error) {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// DEBUG LOG
+	fmt.Printf("DEBUG CreateExperiment - Namespace: %s, Body: %s\n", c.Namespace, string(jsonData))
+
 	url := fmt.Sprintf("%s/apis/v1beta1/experiments", c.BaseURL)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -222,6 +228,9 @@ func (c *Client) CreateExperiment(name, description string) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	c.addAuth(req) // <--- AGGIUNGI AUTH
 
+	// DEBUG LOG
+	fmt.Printf("DEBUG CreateExperiment - URL: %s, Headers: %v\n", url, req.Header)
+
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to create experiment: %w", err)
@@ -229,6 +238,9 @@ func (c *Client) CreateExperiment(name, description string) (string, error) {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+
+	// DEBUG LOG
+	fmt.Printf("DEBUG CreateExperiment - Status: %d, Response: %s\n", resp.StatusCode, string(body))
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return "", fmt.Errorf("create experiment failed with status %d: %s", resp.StatusCode, string(body))

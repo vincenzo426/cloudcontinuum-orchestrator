@@ -3,8 +3,8 @@ package kubeflow
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
+	//"os"
+	//"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -21,17 +21,17 @@ func NewManager(namespace string) *Manager {
 	endpoints := getKubeflowEndpoints()
 
 	// 1. Leggi il token dal file montato
-	token, err := readTokenFromFile("/var/run/secrets/kubeflow/token")
+	/*token, err := readTokenFromFile("/var/run/secrets/kubeflow/token")
 	if err != nil {
 		// Logga errore ma continua (magari siamo in locale senza token)
 		fmt.Printf("WARNING: Could not read Kubeflow token: %v\n", err)
 	} else {
 		fmt.Println("INFO: Kubeflow token loaded successfully")
-	}
+	}*/
 
 	for clusterName, endpoint := range endpoints {
 		// 2. Passa il token al client
-		clients[clusterName] = NewClient(endpoint, namespace, token)
+		clients[clusterName] = NewClient(endpoint, namespace, "")
 	}
 
 	return &Manager{
@@ -41,25 +41,25 @@ func NewManager(namespace string) *Manager {
 }
 
 // readTokenFromFile legge e pulisce il token dal file
-func readTokenFromFile(path string) (string, error) {
+/*func readTokenFromFile(path string) (string, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(content)), nil
-}
+}*/
 
 // getKubeflowEndpoints returns endpoints based on environment
 func getKubeflowEndpoints() map[string]string {
 	// Production - Submariner clusterset DNS puntando al GATEWAY
-    // Nota: Aggiungiamo "/pipeline" alla fine perché il Gateway usa questo prefisso
-    // per instradare le richieste al servizio ml-pipeline
-    return map[string]string{
-        "cloud_cluster":  "http://cloud-cluster.ml-pipeline.kubeflow.svc.clusterset.local.:8888",
+	// Nota: Aggiungiamo "/pipeline" alla fine perché il Gateway usa questo prefisso
+	// per instradare le richieste al servizio ml-pipeline
+	return map[string]string{
+		"cloud_cluster":  "http://cloud-cluster.ml-pipeline.kubeflow.svc.clusterset.local.:8888",
 		"edge_cluster_1": "http://edge-cluster-1.ml-pipeline.kubeflow.svc.clusterset.local.:8888",
 		"edge_cluster_2": "http://edge-cluster-2.ml-pipeline.kubeflow.svc.clusterset.local.:8888",
 		"edge_cluster_3": "http://edge-cluster-3.ml-pipeline.kubeflow.svc.clusterset.local.:8888",
-    }
+	}
 }
 
 // GetClient returns the Kubeflow client for a specific cluster

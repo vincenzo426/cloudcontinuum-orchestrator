@@ -4,7 +4,7 @@ from kfp import compiler
 # 1. Definizione del Primo Componente (Leggero)
 # Questo componente simula la preparazione dei dati.
 # Non richiede molta potenza, quindi assegneremo risorse basse.
-@dsl.component
+@dsl.component(base_image='python:3.9')
 def preprocess_data_op() -> str:
     import time
     print("Inizio pre-processing dei dati...")
@@ -16,7 +16,7 @@ def preprocess_data_op() -> str:
 # 2. Definizione del Secondo Componente (Pesante)
 # Questo componente simula il training di un modello.
 # Richiede più calcoli, quindi assegneremo più CPU e RAM.
-@dsl.component
+@dsl.component(base_image='python:3.9')
 def train_model_op(dataset_path: str):
     import time
     print(f"Lettura del dataset da: {dataset_path}")

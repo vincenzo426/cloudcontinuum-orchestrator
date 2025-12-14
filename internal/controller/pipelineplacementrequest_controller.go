@@ -456,7 +456,7 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	metricsCollector.Start(ctx)
 
 	// Initialize Kubeflow manager
-	r.kubeflowManager = kubeflow.NewManager("kubeflow-user-example-com")
+	r.kubeflowManager = kubeflow.NewManager("kubeflow")
 
 	// Log configured clusters
 	ctrl.Log.Info("PipelinePlacementRequest controller initialized",

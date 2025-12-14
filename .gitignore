@@ -30,3 +30,11 @@ go.work
 *.kubeconfig
 myvenv
 kubeconfig-secrets
+hello_pipeline.py
+hello_pipeline.yaml
+pipeline_resources.py
+pipeline_resources.yaml
+rollbackpod.sh
+test-edge-pipeline.sh
+configmap.sh
+build&deploy.sh
