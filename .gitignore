@@ -38,3 +38,5 @@ rollbackpod.sh
 test-edge-pipeline.sh
 configmap.sh
 build&deploy.sh
+setup-kubeflow-token-complete.sh
+test-pipelines.sh

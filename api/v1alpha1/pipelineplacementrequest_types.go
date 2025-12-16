@@ -136,6 +136,9 @@ type PipelinePlacementRequestStatus struct {
 	// +optional
 	ExperimentName string `json:"experimentName,omitempty"`
 
+	// Parameters used for the pipeline run
+	// +optional
+	Parameters map[string]string `json:"parameters,omitempty"`
 	// Conditions represent the current state
 	// +listType=map
 	// +listMapKey=type

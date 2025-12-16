@@ -134,6 +134,13 @@ func (in *PipelinePlacementRequestStatus) DeepCopyInto(out *PipelinePlacementReq
 		*out = new(PipelineResourcesSummary)
 		**out = **in
 	}
+	if in.Parameters != nil {
+		in, out := &in.Parameters, &out.Parameters
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

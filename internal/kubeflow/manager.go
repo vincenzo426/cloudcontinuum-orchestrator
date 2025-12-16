@@ -3,36 +3,62 @@ package kubeflow
 import (
 	"context"
 	"fmt"
-	//"os"
-	//"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// Manager manages Kubeflow clients for multiple clusters
+// ============================================================================
+// STRUTTURE DATI
+// ============================================================================
+
+// Manager gestisce i client Kubeflow per cluster multipli nel CloudContinuum.
+// Mantiene una mappa di client (uno per ogni cluster) e il namespace di default.
 type Manager struct {
-	clients   map[string]*Client
-	namespace string
+	clients   map[string]*Client // Mappa clusterName -> Client Kubeflow
+	namespace string             // Namespace di default per le operazioni
 }
 
-// NewManager creates a new Kubeflow manager
+// ============================================================================
+// COSTRUTTORE
+// ============================================================================
+
+// NewManager crea e inizializza un nuovo Manager Kubeflow.
+// Parametri:
+//   - namespace: namespace Kubernetes dove verranno create le risorse
+//
+// Ritorna un Manager configurato con client per tutti i cluster disponibili.
 func NewManager(namespace string) *Manager {
+
+	fmt.Printf("═══════════════════════════════════════════════════════\n")
+	fmt.Printf("✓ Kubeflow Manager initialized\n")
+	fmt.Printf("  Namespace: '%s'\n", namespace)
+	fmt.Printf("═══════════════════════════════════════════════════════\n")
+	fmt.Printf("\n")
+
+	// Inizializza la mappa dei client
 	clients := make(map[string]*Client)
+
+	// Ottiene gli endpoint di tutti i cluster Kubeflow
 	endpoints := getKubeflowEndpoints()
 
-	// 1. Leggi il token dal file montato
-	/*token, err := readTokenFromFile("/var/run/secrets/kubeflow/token")
-	if err != nil {
-		// Logga errore ma continua (magari siamo in locale senza token)
-		fmt.Printf("WARNING: Could not read Kubeflow token: %v\n", err)
-	} else {
-		fmt.Println("INFO: Kubeflow token loaded successfully")
-	}*/
-
+	// Crea un client per ogni cluster disponibile
+	// Nota: il token è vuoto ("") perché usiamo Kubeflow in standalone mode
 	for clusterName, endpoint := range endpoints {
-		// 2. Passa il token al client
 		clients[clusterName] = NewClient(endpoint, namespace, "")
+
+		// LOG DEBUG: Client creato
+		fmt.Printf("✓ Client created for cluster: %s\n", clusterName)
+		fmt.Printf("  - Endpoint: %s\n", endpoint)
+		fmt.Printf("  - Namespace: %s\n", namespace)
+		fmt.Printf("\n")
 	}
+
+	fmt.Printf("═══════════════════════════════════════════════════════\n")
+	fmt.Printf("✓ Kubeflow Manager initialized\n")
+	fmt.Printf("  Total clients: %d\n", len(clients))
+	fmt.Printf("  Namespace: '%s'\n", namespace)
+	fmt.Printf("═══════════════════════════════════════════════════════\n")
+	fmt.Printf("\n")
 
 	return &Manager{
 		clients:   clients,
@@ -40,20 +66,16 @@ func NewManager(namespace string) *Manager {
 	}
 }
 
-// readTokenFromFile legge e pulisce il token dal file
-/*func readTokenFromFile(path string) (string, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(content)), nil
-}*/
+// ============================================================================
+// CONFIGURAZIONE CLUSTER
+// ============================================================================
 
-// getKubeflowEndpoints returns endpoints based on environment
+// getKubeflowEndpoints restituisce gli endpoint dei cluster Kubeflow.
+// Utilizza i DNS Submariner ClusterSet per comunicazione cross-cluster.
+//
+// Formato endpoint: http://<cluster-name>.<service>.<namespace>.svc.clusterset.local.:8888
+// Porta 8888: Gateway Submariner che instrada le richieste al servizio ml-pipeline
 func getKubeflowEndpoints() map[string]string {
-	// Production - Submariner clusterset DNS puntando al GATEWAY
-	// Nota: Aggiungiamo "/pipeline" alla fine perché il Gateway usa questo prefisso
-	// per instradare le richieste al servizio ml-pipeline
 	return map[string]string{
 		"cloud_cluster":  "http://cloud-cluster.ml-pipeline.kubeflow.svc.clusterset.local.:8888",
 		"edge_cluster_1": "http://edge-cluster-1.ml-pipeline.kubeflow.svc.clusterset.local.:8888",
@@ -62,7 +84,17 @@ func getKubeflowEndpoints() map[string]string {
 	}
 }
 
-// GetClient returns the Kubeflow client for a specific cluster
+// ============================================================================
+// METODI PUBBLICI
+// ============================================================================
+
+// GetClient restituisce il client Kubeflow per un cluster specifico.
+// Parametri:
+//   - clusterName: nome del cluster (es. "cloud_cluster", "edge_cluster_1")
+//
+// Ritorna:
+//   - *Client: puntatore al client Kubeflow
+//   - error: errore se il cluster non esiste
 func (m *Manager) GetClient(clusterName string) (*Client, error) {
 	client, ok := m.clients[clusterName]
 	if !ok {
@@ -71,7 +103,25 @@ func (m *Manager) GetClient(clusterName string) (*Client, error) {
 	return client, nil
 }
 
-// UploadAndRunPipeline uploads a pipeline and creates a run with experiment support
+// UploadAndRunPipeline orchestra il processo completo di deploy di una pipeline:
+// 1. Upload della pipeline YAML al cluster target
+// 2. Creazione/recupero dell'experiment
+// 3. Creazione ed esecuzione della run
+//
+// Parametri:
+//   - ctx: context per logging e cancellazione
+//   - clusterName: cluster dove eseguire la pipeline
+//   - pipelineName: nome da assegnare alla pipeline
+//   - pipelineYAML: contenuto YAML della pipeline (Kubeflow IR v2.1.0)
+//   - runName: nome da assegnare all'esecuzione
+//   - experimentID: ID experiment esistente (opzionale, usa "" per auto-creazione)
+//   - experimentName: nome experiment da creare (opzionale, default: "cloudcontinuum-default")
+//   - parameters: parametri runtime da passare alla pipeline
+//
+// Ritorna:
+//   - runID: ID univoco dell'esecuzione creata
+//   - runURL: URL per accedere alla run nella UI Kubeflow
+//   - error: errore in caso di fallimento
 func (m *Manager) UploadAndRunPipeline(
 	ctx context.Context,
 	clusterName string,
@@ -85,13 +135,17 @@ func (m *Manager) UploadAndRunPipeline(
 
 	logger := log.FromContext(ctx)
 
-	// Get client for target cluster
+	// ========================================================================
+	// FASE 1: Recupero del client per il cluster target
+	// ========================================================================
 	client, err := m.GetClient(clusterName)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get client for cluster %s: %w", clusterName, err)
 	}
 
-	// Step 1: Upload pipeline
+	// ========================================================================
+	// FASE 2: Upload della pipeline al cluster
+	// ========================================================================
 	logger.Info("Uploading pipeline to Kubeflow",
 		"cluster", clusterName,
 		"baseURL", client.BaseURL,
@@ -106,15 +160,17 @@ func (m *Manager) UploadAndRunPipeline(
 		"pipelineID", pipelineID,
 		"cluster", clusterName)
 
-	// Step 2: Get/Create Experiment
+	// ========================================================================
+	// FASE 3: Gestione dell'Experiment
+	// ========================================================================
 	var finalExperimentID string
 
 	if experimentID != "" {
-		// Use user-specified experiment
+		// Usa l'experiment specificato dall'utente
 		logger.Info("Using user-specified experiment", "experimentID", experimentID)
 		finalExperimentID = experimentID
 	} else {
-		// Create/find default experiment
+		// Crea o recupera l'experiment di default
 		defaultExpName := experimentName
 		if defaultExpName == "" {
 			defaultExpName = "cloudcontinuum-default"
@@ -131,7 +187,9 @@ func (m *Manager) UploadAndRunPipeline(
 			"name", defaultExpName)
 	}
 
-	// Step 3: Create Run
+	// ========================================================================
+	// FASE 4: Creazione ed esecuzione della Run
+	// ========================================================================
 	logger.Info("Creating pipeline run",
 		"pipelineID", pipelineID,
 		"experimentID", finalExperimentID,

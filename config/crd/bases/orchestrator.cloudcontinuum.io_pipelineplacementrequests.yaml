@@ -198,6 +198,11 @@ spec:
               experimentName:
                 description: ExperimentName used for the run
                 type: string
+              parameters:
+                additionalProperties:
+                  type: string
+                description: Parameters used for the pipeline run
+                type: object
               pipelineRunID:
                 description: PipelineRunID from Kubeflow
                 type: string
