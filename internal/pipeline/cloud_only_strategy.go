@@ -36,7 +36,8 @@ func (s *CloudOnlyPipelineStrategy) SelectCluster(
 	// Verifica che il cloud cluster sia disponibile
 	cloudMetrics := metrics.GetCluster(cloudCluster)
 	if cloudMetrics == nil || !cloudMetrics.Available {
-		return "", "", fmt.Errorf("cloud cluster not available")
+		decision := "Cloud-only strategy: cloud_cluster is not available."
+		return "", decision, fmt.Errorf("cloud cluster not available")
 	}
 
 	// Calcola risorse totali richieste dalla pipeline
@@ -44,13 +45,20 @@ func (s *CloudOnlyPipelineStrategy) SelectCluster(
 
 	// Verifica che il cloud abbia risorse sufficienti per l'INTERA pipeline
 	if cloudMetrics.CPUAvailable < totalResources.TotalCPU {
-		return "", "", fmt.Errorf(
-			"insufficient CPU on cloud cluster: pipeline needs %d mCores, available %d mCores",
+		decision := fmt.Sprintf(
+			"Cloud-only strategy: Insufficient CPU on cloud cluster. "+
+				"Pipeline needs %d mCores, available %d mCores.",
+			totalResources.TotalCPU, cloudMetrics.CPUAvailable)
+		return "", decision, fmt.Errorf("insufficient CPU on cloud cluster: pipeline needs %d mCores, available %d mCores",
 			totalResources.TotalCPU, cloudMetrics.CPUAvailable)
 	}
 
 	if cloudMetrics.MemoryAvailable < totalResources.TotalMemory {
-		return "", "", fmt.Errorf(
+		decision := fmt.Sprintf(
+			"Cloud-only strategy: Insufficient memory on cloud cluster. "+
+				"Pipeline needs %d bytes, available %d bytes.",
+			totalResources.TotalMemory, cloudMetrics.MemoryAvailable)
+		return "", decision, fmt.Errorf(
 			"insufficient memory on cloud cluster: pipeline needs %d bytes, available %d bytes",
 			totalResources.TotalMemory, cloudMetrics.MemoryAvailable)
 	}

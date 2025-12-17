@@ -50,7 +50,8 @@ func (s *SimplePipelineHeuristicStrategy) SelectCluster(
 			)
 			return "cloud_cluster", decision, nil
 		}
-		return "", "", fmt.Errorf("pipeline requires GPU but cloud cluster has insufficient resources")
+		decision := "Simple-heuristic: Pipeline requires GPU but cloud cluster has insufficient resources."
+		return "", decision, fmt.Errorf("pipeline requires GPU but cloud cluster has insufficient resources")
 	}
 
 	// Euristica 2: Pipeline pesante (>2 cores totali) → preferisci cloud
@@ -87,7 +88,10 @@ func (s *SimplePipelineHeuristicStrategy) SelectCluster(
 	// Euristica 4: Fallback → cluster con più risorse disponibili
 	bestCluster, bestAvailable := s.findBestCluster(totalResources, metrics)
 	if bestCluster == "" {
-		return "", "", fmt.Errorf(
+		decision := fmt.Sprintf(
+			"no cluster has sufficient resources for pipeline (needs %d mCores CPU, %d bytes memory)",
+			totalResources.TotalCPU, totalResources.TotalMemory)
+		return "", decision, fmt.Errorf(
 			"no cluster has sufficient resources for pipeline (needs %d mCores CPU, %d bytes memory)",
 			totalResources.TotalCPU, totalResources.TotalMemory)
 	}
@@ -130,6 +134,5 @@ func (s *SimplePipelineHeuristicStrategy) findBestCluster(
 			}
 		}
 	}
-
 	return bestCluster, maxAvailableCPU
 }

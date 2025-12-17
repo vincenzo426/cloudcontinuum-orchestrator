@@ -29,7 +29,7 @@ import (
 //   - Calcolo basato su resource requests (come Kubernetes scheduler)
 //   - Misurazione latenze cross-cluster
 type RealMetricsCollector struct {
-	config  *Config                 // Configurazione del collector (intervalli, timeout)
+	config  *Config                  // Configurazione del collector (intervalli, timeout)
 	clients map[string]client.Client // Client Kubernetes per ogni cluster
 
 	// Cache delle metriche con protezione concorrenza
@@ -38,7 +38,7 @@ type RealMetricsCollector struct {
 	cacheMutex     sync.RWMutex              // Mutex per accesso thread-safe
 
 	// Controllo background refresh
-	stopChan chan struct{} // Canale per segnalare lo stop
+	stopChan chan struct{}  // Canale per segnalare lo stop
 	stopWg   sync.WaitGroup // WaitGroup per shutdown graceful
 }
 
@@ -134,7 +134,7 @@ func (c *RealMetricsCollector) CollectMetrics(ctx context.Context) (*placement.C
 	// Verifica validità della cache
 	cacheAge := time.Since(c.cacheTimestamp)
 	if cacheAge > c.config.CacheTTL {
-		return nil, fmt.Errorf("metrics cache expired (age: %v, TTL: %v)", 
+		return nil, fmt.Errorf("metrics cache expired (age: %v, TTL: %v)",
 			cacheAge, c.config.CacheTTL)
 	}
 
@@ -216,7 +216,7 @@ func (c *RealMetricsCollector) refresh(ctx context.Context) error {
 
 	for clusterName, clusterClient := range c.clients {
 		wg.Add(1)
-		
+
 		// Lancia goroutine per ogni cluster
 		go func(name string, cli client.Client) {
 			defer wg.Done()
@@ -224,7 +224,7 @@ func (c *RealMetricsCollector) refresh(ctx context.Context) error {
 			// Raccogli metriche da questo cluster
 			metric, err := c.collectClusterMetrics(ctx, name, cli)
 			if err != nil {
-				logger.Error(err, "❌ Failed to collect metrics from cluster", 
+				logger.Error(err, "❌ Failed to collect metrics from cluster",
 					"cluster", name)
 				// Cluster non disponibile: escluso dalla snapshot
 				return
@@ -291,11 +291,11 @@ func (c *RealMetricsCollector) refresh(ctx context.Context) error {
 //   - Timeout configurabile via config.MetricsTimeout
 //   - Usage metrics opzionale (richiede metrics-server)
 func (c *RealMetricsCollector) collectClusterMetrics(
-	ctx context.Context, 
-	clusterName string, 
+	ctx context.Context,
+	clusterName string,
 	cli client.Client,
 ) (*placement.ClusterMetric, error) {
-	
+
 	// Applica timeout per evitare blocchi su cluster lenti
 	timeoutCtx, cancel := context.WithTimeout(ctx, c.config.MetricsTimeout)
 	defer cancel()
@@ -323,8 +323,8 @@ func (c *RealMetricsCollector) collectClusterMetrics(
 		cpuCap := node.Status.Capacity[corev1.ResourceCPU]
 		memCap := node.Status.Capacity[corev1.ResourceMemory]
 
-		totalCPUCapacity += cpuCap.MilliValue()    // CPU in millicores
-		totalMemoryCapacity += memCap.Value()       // Memory in bytes
+		totalCPUCapacity += cpuCap.MilliValue() // CPU in millicores
+		totalMemoryCapacity += memCap.Value()   // Memory in bytes
 	}
 
 	// ========================================================================
@@ -342,8 +342,8 @@ func (c *RealMetricsCollector) collectClusterMetrics(
 
 	for _, pod := range podList.Items {
 		// Skippa pod terminati (non consumano risorse)
-		if pod.Status.Phase == corev1.PodSucceeded || 
-		   pod.Status.Phase == corev1.PodFailed {
+		if pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 
@@ -367,9 +367,9 @@ func (c *RealMetricsCollector) collectClusterMetrics(
 	// ma NON è quello che lo scheduler usa per placement decisions.
 	var totalCPUUsed, totalMemoryUsed int64
 	nodeMetricsList := &metricsv1beta1.NodeMetricsList{}
-	
+
 	if err := cli.List(timeoutCtx, nodeMetricsList); err != nil {
-		logger.V(1).Info("⚠️  Could not get node metrics (usage), using requests only", 
+		logger.V(1).Info("⚠️  Could not get node metrics (usage), using requests only",
 			"cluster", clusterName, "error", err)
 	} else {
 		for _, nodeMetrics := range nodeMetricsList.Items {
@@ -404,7 +404,7 @@ func (c *RealMetricsCollector) collectClusterMetrics(
 	return &placement.ClusterMetric{
 		Name:            clusterName,
 		CPUCapacity:     totalCPUCapacity,
-		CPUUsed:         totalCPURequested,    // ✅ Usa REQUESTS come scheduler
+		CPUUsed:         totalCPURequested, // ✅ Usa REQUESTS come scheduler
 		CPUAvailable:    totalCPUAvailable,
 		MemoryCapacity:  totalMemoryCapacity,
 		MemoryUsed:      totalMemoryRequested, // ✅ Usa REQUESTS come scheduler
@@ -435,16 +435,16 @@ func (c *RealMetricsCollector) collectClusterMetrics(
 //   - Timeout configurabile via config.LatencyTimeout
 //   - Errori producono latenza molto alta (9999ms) per penalizzare cluster unreachable
 func (c *RealMetricsCollector) measureLatencies(
-	ctx context.Context, 
+	ctx context.Context,
 	metrics *placement.ClusterMetrics,
 ) {
 	logger := log.FromContext(ctx)
 
 	// Lista di tutti i cluster da testare
 	clusterNames := []string{
-		"cloud_cluster", 
-		"edge_cluster_1", 
-		"edge_cluster_2", 
+		"cloud_cluster",
+		"edge_cluster_1",
+		"edge_cluster_2",
 		"edge_cluster_3",
 	}
 
@@ -506,10 +506,10 @@ func (c *RealMetricsCollector) measureLatencies(
 //   - 9999ms indica cluster unreachable o errore
 //   - Latenza include: network RTT + API server response time
 func (c *RealMetricsCollector) measureLatency(
-	ctx context.Context, 
+	ctx context.Context,
 	cli client.Client,
 ) int64 {
-	
+
 	// Applica timeout per evitare blocchi
 	timeoutCtx, cancel := context.WithTimeout(ctx, c.config.LatencyTimeout)
 	defer cancel()

@@ -39,7 +39,10 @@ func (s *DataLocalityPipelineStrategy) SelectCluster(
 	// Verifica che il cluster target sia disponibile
 	targetMetrics := metrics.GetCluster(dataLocation)
 	if targetMetrics == nil || !targetMetrics.Available {
-		return "", "", fmt.Errorf("target cluster %s not available", dataLocation)
+		decision := fmt.Sprintf(
+			"Data-locality strategy: target cluster %s is not available.",
+			dataLocation)
+		return "", decision, fmt.Errorf("target cluster %s not available", dataLocation)
 	}
 
 	// Calcola risorse totali richieste dalla pipeline
@@ -47,13 +50,21 @@ func (s *DataLocalityPipelineStrategy) SelectCluster(
 
 	// Verifica che abbia risorse sufficienti per l'INTERA pipeline
 	if targetMetrics.CPUAvailable < totalResources.TotalCPU {
-		return "", "", fmt.Errorf(
+		decision := fmt.Sprintf(
+			"Data-locality strategy: Insufficient CPU on %s. "+
+				"Pipeline needs %d mCores, available %d mCores.",
+			dataLocation, totalResources.TotalCPU, targetMetrics.CPUAvailable)
+		return "", decision, fmt.Errorf(
 			"insufficient CPU on %s: pipeline needs %d mCores, available %d mCores",
 			dataLocation, totalResources.TotalCPU, targetMetrics.CPUAvailable)
 	}
 
 	if targetMetrics.MemoryAvailable < totalResources.TotalMemory {
-		return "", "", fmt.Errorf(
+		decision := fmt.Sprintf(
+			"Data-locality strategy: Insufficient memory on %s. "+
+				"Pipeline needs %d bytes, available %d bytes.",
+			dataLocation, totalResources.TotalMemory, targetMetrics.MemoryAvailable)
+		return "", decision, fmt.Errorf(
 			"insufficient memory on %s: pipeline needs %d bytes, available %d bytes",
 			dataLocation, totalResources.TotalMemory, targetMetrics.MemoryAvailable)
 	}
