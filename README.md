@@ -138,6 +138,19 @@ La strategia **simple-heuristic-pipeline** implementa una logica di decisione ge
    - Memory disponibile: >2.5 GB richiesti
 
 ### Esempio: PipelinePlacementRequest fallita
+```yaml
+apiVersion: orchestrator.cloudcontinuum.io/v1alpha1
+kind: PipelinePlacementRequest
+metadata:
+  name: test-failure-cloud-request
+  namespace: kubeflow
+spec:
+  pipelineName: "hello-cloud"
+  placementStrategy: "cloud-only-pipeline"
+  experimentName: "hello-cloud-experiment"
+  pipelineSource:
+    type: inline
+```
 
 ```bash
 NAME                                      STRATEGY                    TARGET           PIPELINE                          AGE

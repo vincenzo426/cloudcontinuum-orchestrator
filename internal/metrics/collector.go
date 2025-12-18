@@ -26,7 +26,7 @@ import (
 //   - Refresh periodico automatico in background
 //   - Cache thread-safe con TTL configurabile
 //   - Raccolta parallela da cluster multipli
-//   - Calcolo basato su resource requests (come Kubernetes scheduler)
+//   - Calcolo basato su resource requests
 //   - Misurazione latenze cross-cluster
 type RealMetricsCollector struct {
 	config  *Config                  // Configurazione del collector (intervalli, timeout)
@@ -97,12 +97,10 @@ func (c *RealMetricsCollector) Start(ctx context.Context) {
 	go c.backgroundRefresh(ctx)
 }
 
-// Stop ferma il refresh in background e attende il completamento.
-// Implementa shutdown graceful attendendo che eventuali refresh in corso terminino.
+// Stop ferma il refresh in background e attende il completamento..
 //
 // Note:
 //   - Bloccante: ritorna solo dopo che la goroutine è terminata
-//   - Safe da chiamare multiple volte (chiudere un canale già chiuso panics)
 //   - Dovrebbe essere chiamato durante il cleanup dell'applicazione
 func (c *RealMetricsCollector) Stop() {
 	close(c.stopChan)
@@ -281,12 +279,12 @@ func (c *RealMetricsCollector) refresh(ctx context.Context) error {
 //  1. Lista tutti i nodi del cluster
 //  2. Calcola capacità totale (somma di tutti i nodi)
 //  3. Lista tutti i pod attivi
-//  4. Somma resource REQUESTS di tutti i pod (non usage!)
+//  4. Somma resource REQUESTS di tutti i pod
 //  5. Calcola disponibilità: capacity - requests
 //  6. Opzionalmente raccoglie usage per logging
 //
 // Note critiche:
-//   - Usa REQUESTS non USAGE: questo è come Kubernetes scheduler decide placement
+//  
 //   - Skip pod terminati (Succeeded/Failed)
 //   - Timeout configurabile via config.MetricsTimeout
 //   - Usage metrics opzionale (richiede metrics-server)
@@ -404,10 +402,10 @@ func (c *RealMetricsCollector) collectClusterMetrics(
 	return &placement.ClusterMetric{
 		Name:            clusterName,
 		CPUCapacity:     totalCPUCapacity,
-		CPUUsed:         totalCPURequested, // ✅ Usa REQUESTS come scheduler
+		CPUUsed:         totalCPURequested, 
 		CPUAvailable:    totalCPUAvailable,
 		MemoryCapacity:  totalMemoryCapacity,
-		MemoryUsed:      totalMemoryRequested, // ✅ Usa REQUESTS come scheduler
+		MemoryUsed:      totalMemoryRequested,
 		MemoryAvailable: totalMemoryAvailable,
 		Available:       true,
 	}, nil
