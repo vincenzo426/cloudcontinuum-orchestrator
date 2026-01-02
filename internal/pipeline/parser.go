@@ -49,7 +49,7 @@ type PipelineInfo struct {
 // Component rappresenta un componente riutilizzabile della pipeline.
 // Ogni componente definisce input/output e punta a un executor.
 type Component struct {
-	ExecutorLabel     string       `yaml:"executorLabel"`                // Label dell'executor da usare
+	ExecutorLabel     string       `yaml:"executorLabel"`               // Label dell'executor da usare
 	InputDefinitions  *Definitions `yaml:"inputDefinitions,omitempty"`  // Input del componente
 	OutputDefinitions *Definitions `yaml:"outputDefinitions,omitempty"` // Output del componente
 }
@@ -92,8 +92,8 @@ type ContainerResources struct {
 // Root contiene il DAG (Direct Acyclic Graph) della pipeline.
 // Definisce le task e il loro ordine di esecuzione.
 type Root struct {
-	DAG              DAG          `yaml:"dag"`                          // Grafo delle task
-	InputDefinitions *Definitions `yaml:"inputDefinitions,omitempty"`   // Input della pipeline
+	DAG              DAG          `yaml:"dag"`                        // Grafo delle task
+	InputDefinitions *Definitions `yaml:"inputDefinitions,omitempty"` // Input della pipeline
 }
 
 // DAG rappresenta il grafo delle task con dipendenze.
@@ -215,8 +215,8 @@ func (p *Parser) CalculateTotalResources(pipeline *PipelineIR) (cpu, memory int6
 func (p *Parser) parseExecutorResources(executor Executor) (cpu, memory int64, gpu int) {
 	// Default Kubernetes per container senza limiti/requests
 	const (
-		defaultCPU    = int64(100)          // 100 millicores
-		defaultMemory = int64(134217728)    // 128 MiB in bytes
+		defaultCPU    = int64(100)       // 100 millicores
+		defaultMemory = int64(134217728) // 128 MiB in bytes
 	)
 
 	// Nessuna spec risorse: usa default

@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings" // <-- AGGIUNGI QUESTA RIGA
 	"time"
 )
 
@@ -70,6 +71,23 @@ type PipelineUploadResponse struct {
 	Name        string    `json:"name"`        // Nome della pipeline
 	Description string    `json:"description"` // Descrizione della pipeline
 	Error       string    `json:"error"`       // Messaggio di errore (se presente)
+}
+
+// PipelineVersionUploadResponse rappresenta la risposta dopo l'upload di una versione
+type PipelineVersionUploadResponse struct {
+	ID          string    `json:"id"`   // ID della versione
+	Name        string    `json:"name"` // Nome della versione
+	CreatedAt   time.Time `json:"created_at"`
+	Description string    `json:"description"`
+	PipelineID  string    `json:"pipeline_id"` // ID della pipeline parent
+	Error       string    `json:"error"`
+}
+
+// PipelineListResponse per listare pipeline esistenti
+type PipelineListResponse struct {
+	Pipelines     []PipelineUploadResponse `json:"pipelines"`
+	TotalSize     int                      `json:"total_size"`
+	NextPageToken string                   `json:"next_page_token"`
 }
 
 // ============================================================================
@@ -148,6 +166,168 @@ func (c *Client) UploadPipeline(name string, pipelineYAML []byte) (string, error
 	}
 
 	return uploadResp.ID, nil
+}
+
+// GetPipelineByName cerca una pipeline per nome
+func (c *Client) GetPipelineByName(name string) (string, error) {
+	url := fmt.Sprintf("%s/apis/v1beta1/pipelines", c.BaseURL)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	c.addAuth(req)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to list pipelines: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("list pipelines failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var listResp PipelineListResponse
+	if err := json.Unmarshal(body, &listResp); err != nil {
+		return "", fmt.Errorf("failed to parse pipeline list: %w", err)
+	}
+
+	// Cerca pipeline con nome esatto
+	for _, pipeline := range listResp.Pipelines {
+		if pipeline.Name == name || pipeline.Name == name+".yaml" {
+			fmt.Printf("DEBUG NomePipelineTrovata - NAME: %s\n", pipeline.Name)
+			fmt.Printf("DEBUG PipelineIDtrovato - ID: %s\n", pipeline.ID)
+			return pipeline.ID, nil
+		}
+	}
+
+	fmt.Printf("DEBUG NomePipelineTrovata - NAME: %d\n", resp.StatusCode)
+
+	return "", fmt.Errorf("pipeline %s not found", name)
+}
+
+/*
+	func (c *Client) UploadPipelineVersion(pipelineID, versionName string, pipelineYAML []byte) (string, error) {
+		var requestBody bytes.Buffer
+		writer := multipart.NewWriter(&requestBody)
+
+		// IMPORTANTE: L'ORDINE dei campi potrebbe essere importante
+		// Aggiungi pipelineid PRIMA di uploadfile
+		if err := writer.WriteField("pipelineid", pipelineID); err != nil {
+			return "", fmt.Errorf("failed to write pipelineid field: %w", err)
+		}
+
+		// Aggiungi il campo "name" (nome della versione)
+		if err := writer.WriteField("name", versionName); err != nil {
+			return "", fmt.Errorf("failed to write name field: %w", err)
+		}
+
+		// Crea il campo "uploadfile" con il contenuto YAML (ULTIMO)
+		part, err := writer.CreateFormFile("uploadfile", versionName+".yaml")
+		if err != nil {
+			return "", fmt.Errorf("failed to create form file: %w", err)
+		}
+
+		if _, err := part.Write(pipelineYAML); err != nil {
+			return "", fmt.Errorf("failed to write pipeline yaml: %w", err)
+		}
+
+		if err := writer.Close(); err != nil {
+			return "", fmt.Errorf("failed to close writer: %w", err)
+		}
+
+		url := fmt.Sprintf("%s/apis/v1beta1/pipelines/upload_version", c.BaseURL)
+
+		fmt.Printf("DEBUG UploadPipelineVersion - URL: %s\n", url)
+		fmt.Printf("DEBUG UploadPipelineVersion - Pipeline ID: '%s'\n", pipelineID)
+		fmt.Printf("DEBUG UploadPipelineVersion - Version Name: '%s'\n", versionName)
+
+		req, err := http.NewRequest("POST", url, &requestBody)
+		if err != nil {
+			return "", fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		c.addAuth(req)
+
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("failed to upload pipeline version: %w", err)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+
+		fmt.Printf("DEBUG UploadPipelineVersion - Status: %d\n", resp.StatusCode)
+		fmt.Printf("DEBUG UploadPipelineVersion - Response: %s\n", string(body))
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+			return "", fmt.Errorf("upload version failed with status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var versionResp PipelineVersionUploadResponse
+		if err := json.Unmarshal(body, &versionResp); err != nil {
+			return "", fmt.Errorf("failed to parse upload response: %w", err)
+		}
+
+		if versionResp.Error != "" {
+			return "", fmt.Errorf("upload error: %s", versionResp.Error)
+		}
+
+		fmt.Printf("✅ Pipeline version uploaded successfully - ID: %s\n", versionResp.ID)
+
+		return versionResp.ID, nil
+	}
+*/
+func (c *Client) UploadOrVersionPipeline(pipelineName string, pipelineYAML []byte) (pipelineID, versionID string, err error) {
+	fmt.Printf("\n")
+	fmt.Printf("═══════════════════════════════════════════════════════\n")
+	fmt.Printf("🔍 UploadOrVersionPipeline START\n")
+	fmt.Printf("───────────────────────────────────────────────────────\n")
+	fmt.Printf("  Pipeline Name: '%s'\n", pipelineName)
+	fmt.Printf("═══════════════════════════════════════════════════════\n")
+
+	// Prova a trovare pipeline esistente
+	existingPipelineID, err := c.GetPipelineByName(pipelineName)
+
+	if err != nil {
+		// Pipeline non esiste, creala
+		fmt.Printf("❌ Pipeline '%s' non trovata\n", pipelineName)
+		fmt.Printf("➡️  Procedo con creazione NUOVA pipeline\n\n")
+
+		pipelineID, err := c.UploadPipeline(pipelineName, pipelineYAML)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to upload new pipeline: %w", err)
+		}
+		fmt.Printf("✅ Nuova pipeline creata con ID: %s\n\n", pipelineID)
+		return pipelineID, "", nil
+	}
+
+	// Pipeline esiste - usa NOME VERSIONATO per evitare problemi con API versioning
+	fmt.Printf("✅ Pipeline '%s' trovata (ID: %s)\n", pipelineName, existingPipelineID)
+	fmt.Printf("➡️  Creo nuova pipeline con nome versionato\n\n")
+
+	// Rimuovi .yaml dal nome se presente per il timestamp
+	baseName := strings.TrimSuffix(pipelineName, ".yaml")
+	versionedName := fmt.Sprintf("%s-v%s.yaml", baseName, time.Now().Format("20060102-150405"))
+
+	fmt.Printf("📝 Nome versionato: '%s'\n", versionedName)
+
+	newPipelineID, err := c.UploadPipeline(versionedName, pipelineYAML)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to upload versioned pipeline: %w", err)
+	}
+
+	fmt.Printf("✅ Pipeline versionata creata: %s (ID: %s)\n", versionedName, newPipelineID)
+	fmt.Printf("═══════════════════════════════════════════════════════\n\n")
+
+	// Ritorna il nuovo ID
+	return newPipelineID, newPipelineID, nil
 }
 
 // ============================================================================
@@ -367,8 +547,9 @@ type Parameter struct {
 
 // PipelineSpec specifica quale pipeline eseguire e con quali parametri.
 type PipelineSpec struct {
-	PipelineID string      `json:"pipeline_id,omitempty"`
-	Parameters []Parameter `json:"parameters,omitempty"` // ARRAY invece di map
+	PipelineID        string      `json:"pipeline_id,omitempty"`
+	PipelineVersionID string      `json:"pipeline_version_id,omitempty"` // NUOVO
+	Parameters        []Parameter `json:"parameters,omitempty"`          // ARRAY invece di map
 }
 
 // RunRequest rappresenta il body della richiesta per creare una run.
@@ -415,7 +596,7 @@ type RunResponse struct {
 // Endpoint API: POST /apis/v1beta1/runs
 //
 // Nota: La run viene automaticamente associata all'experiment tramite resource_references.
-func (c *Client) CreateRun(pipelineID, runName, experimentID string, parameters map[string]interface{}) (string, string, error) {
+func (c *Client) CreateRun(pipelineID, versionID, runName, experimentID string, parameters map[string]interface{}) (string, string, error) {
 
 	fmt.Printf("\n")
 	fmt.Printf("═══════════════════════════════════════════════════════\n")
@@ -425,6 +606,7 @@ func (c *Client) CreateRun(pipelineID, runName, experimentID string, parameters 
 	fmt.Printf("  Pipeline ID:      %s\n", pipelineID)
 	fmt.Printf("  Run Name:         %s\n", runName)
 	fmt.Printf("  Experiment ID:    %s\n", experimentID)
+	fmt.Printf("  Version ID:      %s\n", versionID)
 	fmt.Printf("═══════════════════════════════════════════════════════\n")
 	fmt.Printf("\n")
 
@@ -435,6 +617,17 @@ func (c *Client) CreateRun(pipelineID, runName, experimentID string, parameters 
 			Name:  name,
 			Value: fmt.Sprintf("%v", value), // Converti a stringa
 		})
+	}
+
+	// Costruisci PipelineSpec con supporto versioni
+	pipelineSpec := PipelineSpec{
+		PipelineID: pipelineID,
+		Parameters: params,
+	}
+
+	// Se c'è una versione specifica, usala
+	if versionID != "" {
+		pipelineSpec.PipelineVersionID = versionID
 	}
 
 	// Costruisci il body della richiesta

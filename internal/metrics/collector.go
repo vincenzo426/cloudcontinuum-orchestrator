@@ -284,7 +284,7 @@ func (c *RealMetricsCollector) refresh(ctx context.Context) error {
 //  6. Opzionalmente raccoglie usage per logging
 //
 // Note critiche:
-//  
+//
 //   - Skip pod terminati (Succeeded/Failed)
 //   - Timeout configurabile via config.MetricsTimeout
 //   - Usage metrics opzionale (richiede metrics-server)
@@ -402,7 +402,7 @@ func (c *RealMetricsCollector) collectClusterMetrics(
 	return &placement.ClusterMetric{
 		Name:            clusterName,
 		CPUCapacity:     totalCPUCapacity,
-		CPUUsed:         totalCPURequested, 
+		CPUUsed:         totalCPURequested,
 		CPUAvailable:    totalCPUAvailable,
 		MemoryCapacity:  totalMemoryCapacity,
 		MemoryUsed:      totalMemoryRequested,

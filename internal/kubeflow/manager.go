@@ -146,19 +146,22 @@ func (m *Manager) UploadAndRunPipeline(
 	// ========================================================================
 	// FASE 2: Upload della pipeline al cluster
 	// ========================================================================
-	logger.Info("Uploading pipeline to Kubeflow",
-		"cluster", clusterName,
-		"baseURL", client.BaseURL,
-		"name", pipelineName)
-
-	pipelineID, err := client.UploadPipeline(pipelineName, pipelineYAML)
+	// Usa la nuova funzione che gestisce versioning automaticamente
+	pipelineID, versionID, err := client.UploadOrVersionPipeline(pipelineName, pipelineYAML)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to upload pipeline: %w", err)
+		return "", "", fmt.Errorf("failed to upload/version pipeline: %w", err)
 	}
 
-	logger.Info("Pipeline uploaded successfully",
-		"pipelineID", pipelineID,
-		"cluster", clusterName)
+	if versionID != "" {
+		logger.Info("Pipeline version created",
+			"pipelineID", pipelineID,
+			"versionID", versionID,
+			"cluster", clusterName)
+	} else {
+		logger.Info("New pipeline created",
+			"pipelineID", pipelineID,
+			"cluster", clusterName)
+	}
 
 	// ========================================================================
 	// FASE 3: Gestione dell'Experiment
@@ -195,7 +198,8 @@ func (m *Manager) UploadAndRunPipeline(
 		"experimentID", finalExperimentID,
 		"name", runName)
 
-	runID, runURL, err = client.CreateRun(pipelineID, runName, finalExperimentID, parameters)
+	// Crea run passando anche versionID
+	runID, runURL, err = client.CreateRun(pipelineID, versionID, runName, finalExperimentID, parameters)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create run: %w", err)
 	}
