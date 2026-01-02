@@ -7,132 +7,110 @@ import (
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/placement"
 )
 
-// SimplePipelineHeuristicStrategy usa euristiche semplici per selezionare il cluster
+// SimplePipelineHeuristicStrategy usa euristiche e delega alle strategie base.
 type SimplePipelineHeuristicStrategy struct {
-	parser *Parser
+	parser               *Parser
+	cloudStrategy        *CloudOnlyPipelineStrategy
+	dataLocalityStrategy *DataLocalityPipelineStrategy
 }
 
-// NewSimplePipelineHeuristicStrategy crea una nuova strategia euristica
+// NewSimplePipelineHeuristicStrategy crea una nuova strategia euristica.
 func NewSimplePipelineHeuristicStrategy() *SimplePipelineHeuristicStrategy {
 	return &SimplePipelineHeuristicStrategy{
-		parser: NewParser(),
+		parser:               NewParser(),
+		cloudStrategy:        NewCloudOnlyPipelineStrategy(),
+		dataLocalityStrategy: NewDataLocalityPipelineStrategy(),
 	}
 }
 
-// Name ritorna il nome della strategia
+// Name ritorna il nome della strategia.
 func (s *SimplePipelineHeuristicStrategy) Name() string {
 	return "simple-heuristic-pipeline"
 }
 
-// SelectCluster usa euristiche per selezionare il cluster migliore
+// SelectCluster usa euristiche per selezionare il cluster migliore.
 func (s *SimplePipelineHeuristicStrategy) SelectCluster(
 	ctx context.Context,
 	pipeline *PipelineIR,
 	dataLocation string,
 	metrics *placement.ClusterMetrics,
 ) (string, string, error) {
-	// Calcola risorse totali richieste dalla pipeline
+
 	totalResources := CalculatePipelineResources(pipeline, s.parser)
 
-	// Euristica 1: Se la pipeline richiede GPU, DEVE andare sul cloud
+	// Euristica 1: GPU → cloud obbligatorio
 	if totalResources.TotalGPU > 0 {
-		cloudMetrics := metrics.GetCluster("cloud_cluster")
-		if cloudMetrics != nil && cloudMetrics.Available &&
-			cloudMetrics.CPUAvailable >= totalResources.TotalCPU &&
-			cloudMetrics.MemoryAvailable >= totalResources.TotalMemory {
-
-			decision := fmt.Sprintf(
-				"Simple-heuristic: Pipeline requires %d GPU, placed on cloud_cluster. "+
-					"Total: %d mCores CPU, %d bytes memory.",
-				totalResources.TotalGPU,
-				totalResources.TotalCPU,
-				totalResources.TotalMemory,
-			)
-			return "cloud_cluster", decision, nil
+		cluster, decision, err := s.cloudStrategy.SelectCluster(ctx, pipeline, dataLocation, metrics)
+		if err != nil {
+			return "", fmt.Sprintf("Simple-heuristic: Pipeline requires %d GPU but %s", totalResources.TotalGPU, err.Error()), err
 		}
-		decision := "Simple-heuristic: Pipeline requires GPU but cloud cluster has insufficient resources."
-		return "", decision, fmt.Errorf("pipeline requires GPU but cloud cluster has insufficient resources")
+		// Sovrascrivi decisione con prefisso euristica
+		decision = fmt.Sprintf("Simple-heuristic: Pipeline requires %d GPU, delegating to cloud-only. %s", totalResources.TotalGPU, decision)
+		return cluster, decision, nil
 	}
 
-	// Euristica 2: Pipeline pesante (>2 cores totali) → preferisci cloud
-	if totalResources.TotalCPU > 2000 {
-		cloudMetrics := metrics.GetCluster("cloud_cluster")
-		if cloudMetrics != nil && cloudMetrics.Available &&
-			cloudMetrics.CPUAvailable >= totalResources.TotalCPU &&
-			cloudMetrics.MemoryAvailable >= totalResources.TotalMemory {
-
-			decision := fmt.Sprintf(
-				"Simple-heuristic: Heavy pipeline (%.2f cores) placed on cloud_cluster for better performance.",
-				float64(totalResources.TotalCPU)/1000,
-			)
-			return "cloud_cluster", decision, nil
+	// Euristica 2: Pipeline pesante → preferisci cloud
+	if totalResources.TotalCPU > heavyPipelineThreshold {
+		cluster, decision, err := s.cloudStrategy.SelectCluster(ctx, pipeline, dataLocation, metrics)
+		if err == nil {
+			decision = fmt.Sprintf("Simple-heuristic: Heavy pipeline (%s), delegating to cloud-only. %s",
+				formatCPUCores(totalResources.TotalCPU), decision)
+			return cluster, decision, nil
 		}
+		// Se cloud fallisce, continua con altre euristiche
 	}
 
-	// Euristica 3: Pipeline leggera + dataLocation specificato → preferisci data locality
+	// Euristica 3: Data locality per pipeline leggere
 	if dataLocation != "" && dataLocation != "none" {
-		dataMetrics := metrics.GetCluster(dataLocation)
-		if dataMetrics != nil && dataMetrics.Available &&
-			dataMetrics.CPUAvailable >= totalResources.TotalCPU &&
-			dataMetrics.MemoryAvailable >= totalResources.TotalMemory {
-
-			decision := fmt.Sprintf(
-				"Simple-heuristic: Light pipeline (%.2f cores) placed on %s (data location) to minimize latency.",
-				float64(totalResources.TotalCPU)/1000,
-				dataLocation,
-			)
-			return dataLocation, decision, nil
+		cluster, decision, err := s.dataLocalityStrategy.SelectCluster(ctx, pipeline, dataLocation, metrics)
+		if err == nil {
+			decision = fmt.Sprintf("Simple-heuristic: Light pipeline (%s), delegating to data-locality. %s",
+				formatCPUCores(totalResources.TotalCPU), decision)
+			return cluster, decision, nil
 		}
+		// Se data locality fallisce, continua con fallback
 	}
 
-	// Euristica 4: Fallback → cluster con più risorse disponibili
-	bestCluster, bestAvailable := s.findBestCluster(totalResources, metrics)
-	if bestCluster == "" {
-		decision := fmt.Sprintf(
-			"no cluster has sufficient resources for pipeline (needs %d mCores CPU, %d bytes memory)",
-			totalResources.TotalCPU, totalResources.TotalMemory)
-		return "", decision, fmt.Errorf(
-			"no cluster has sufficient resources for pipeline (needs %d mCores CPU, %d bytes memory)",
-			totalResources.TotalCPU, totalResources.TotalMemory)
-	}
-
-	decision := fmt.Sprintf(
-		"Simple-heuristic: Pipeline placed on %s (most available resources: %d mCores). "+
-			"Required: %d mCores CPU (%.2f cores), %d bytes memory (%.2f GB).",
-		bestCluster,
-		bestAvailable,
-		totalResources.TotalCPU,
-		float64(totalResources.TotalCPU)/1000,
-		totalResources.TotalMemory,
-		float64(totalResources.TotalMemory)/1_000_000_000,
-	)
-
-	return bestCluster, decision, nil
+	// Euristica 4: Fallback → cluster con più risorse
+	return s.selectBestAvailableCluster(totalResources, metrics)
 }
 
-// findBestCluster trova il cluster con più risorse disponibili che soddisfa i requisiti
-func (s *SimplePipelineHeuristicStrategy) findBestCluster(
-	totalResources PipelineResources,
+// selectBestAvailableCluster seleziona il cluster con più risorse disponibili.
+func (s *SimplePipelineHeuristicStrategy) selectBestAvailableCluster(
+	resources PipelineResources,
 	metrics *placement.ClusterMetrics,
-) (string, int64) {
+) (string, string, error) {
+
 	var bestCluster string
 	var maxAvailableCPU int64 = -1
 
-	for clusterName, clusterMetrics := range metrics.Clusters {
-		if !clusterMetrics.Available {
+	for clusterName, clusterMetric := range metrics.Clusters {
+		if !clusterMetric.Available {
 			continue
 		}
 
-		// Deve avere risorse sufficienti
-		if clusterMetrics.CPUAvailable >= totalResources.TotalCPU &&
-			clusterMetrics.MemoryAvailable >= totalResources.TotalMemory {
+		if clusterMetric.CPUAvailable >= resources.TotalCPU &&
+			clusterMetric.MemoryAvailable >= resources.TotalMemory &&
+			clusterMetric.CPUAvailable > maxAvailableCPU {
 
-			// Preferisci quello con più CPU disponibile
-			if clusterMetrics.CPUAvailable > maxAvailableCPU {
-				maxAvailableCPU = clusterMetrics.CPUAvailable
-				bestCluster = clusterName
-			}
+			maxAvailableCPU = clusterMetric.CPUAvailable
+			bestCluster = clusterName
 		}
 	}
-	return bestCluster, maxAvailableCPU
+
+	if bestCluster == "" {
+		decision := fmt.Sprintf(
+			"Simple-heuristic: No cluster has sufficient resources (needs %s)",
+			formatResourceRequirements(resources))
+		return "", decision, fmt.Errorf("no cluster has sufficient resources")
+	}
+
+	decision := fmt.Sprintf(
+		"Simple-heuristic: Fallback to %s (most available: %d mCores). Required: %s.",
+		bestCluster,
+		maxAvailableCPU,
+		formatResourceRequirements(resources),
+	)
+
+	return bestCluster, decision, nil
 }

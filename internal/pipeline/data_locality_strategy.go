@@ -7,78 +7,59 @@ import (
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/placement"
 )
 
-// DataLocalityPipelineStrategy esegue la pipeline dove risiedono i dati
+// DataLocalityPipelineStrategy esegue la pipeline dove risiedono i dati.
 type DataLocalityPipelineStrategy struct {
 	parser *Parser
 }
 
-// NewDataLocalityPipelineStrategy crea una nuova strategia data-locality
+// NewDataLocalityPipelineStrategy crea una nuova strategia data-locality.
 func NewDataLocalityPipelineStrategy() *DataLocalityPipelineStrategy {
 	return &DataLocalityPipelineStrategy{
 		parser: NewParser(),
 	}
 }
 
-// Name ritorna il nome della strategia
+// Name ritorna il nome della strategia.
 func (s *DataLocalityPipelineStrategy) Name() string {
 	return "data-locality-pipeline"
 }
 
-// SelectCluster seleziona il cluster dove risiedono i dati
+// SelectCluster seleziona il cluster dove risiedono i dati.
 func (s *DataLocalityPipelineStrategy) SelectCluster(
 	ctx context.Context,
 	pipeline *PipelineIR,
 	dataLocation string,
 	metrics *placement.ClusterMetrics,
 ) (string, string, error) {
-	// Se dataLocation non specificato, usa cloud come default
+
+	// Default a cloud se dataLocation non specificato
 	if dataLocation == "" || dataLocation == "none" {
-		dataLocation = "cloud_cluster"
+		dataLocation = defaultDataLocation
 	}
 
-	// Verifica che il cluster target sia disponibile
-	targetMetrics := metrics.GetCluster(dataLocation)
-	if targetMetrics == nil || !targetMetrics.Available {
-		decision := fmt.Sprintf(
-			"Data-locality strategy: target cluster %s is not available.",
-			dataLocation)
-		return "", decision, fmt.Errorf("target cluster %s not available", dataLocation)
+	// Valida disponibilità cluster target
+	targetMetric, err := validateClusterAvailability(dataLocation, metrics)
+	if err != nil {
+		decision := fmt.Sprintf("Data-locality: %s", err.Error())
+		return "", decision, err
 	}
 
-	// Calcola risorse totali richieste dalla pipeline
+	// Calcola risorse richieste
 	totalResources := CalculatePipelineResources(pipeline, s.parser)
 
-	// Verifica che abbia risorse sufficienti per l'INTERA pipeline
-	if targetMetrics.CPUAvailable < totalResources.TotalCPU {
-		decision := fmt.Sprintf(
-			"Data-locality strategy: Insufficient CPU on %s. "+
-				"Pipeline needs %d mCores, available %d mCores.",
-			dataLocation, totalResources.TotalCPU, targetMetrics.CPUAvailable)
-		return "", decision, fmt.Errorf(
-			"insufficient CPU on %s: pipeline needs %d mCores, available %d mCores",
-			dataLocation, totalResources.TotalCPU, targetMetrics.CPUAvailable)
+	// Valida risorse sufficienti
+	if err := validateClusterResources(dataLocation, targetMetric, totalResources); err != nil {
+		decision := fmt.Sprintf("Data-locality: %s", err.Error())
+		return "", decision, err
 	}
 
-	if targetMetrics.MemoryAvailable < totalResources.TotalMemory {
-		decision := fmt.Sprintf(
-			"Data-locality strategy: Insufficient memory on %s. "+
-				"Pipeline needs %d bytes, available %d bytes.",
-			dataLocation, totalResources.TotalMemory, targetMetrics.MemoryAvailable)
-		return "", decision, fmt.Errorf(
-			"insufficient memory on %s: pipeline needs %d bytes, available %d bytes",
-			dataLocation, totalResources.TotalMemory, targetMetrics.MemoryAvailable)
-	}
-
+	// Genera decisione
 	decision := fmt.Sprintf(
-		"Data-locality strategy: Entire pipeline (%d executors) placed on %s (data location). "+
-			"Required: %d mCores CPU (%.2f cores), %d bytes memory (%.2f GB). "+
-			"Minimizes data transfer latency.",
+		"Data-locality: Entire pipeline (%d executors) on %s (data location). "+
+			"Required: %s. Minimizes data transfer latency.",
 		totalResources.ExecutorCount,
 		dataLocation,
-		totalResources.TotalCPU,
-		float64(totalResources.TotalCPU)/1000,
-		totalResources.TotalMemory,
-		float64(totalResources.TotalMemory)/1_000_000_000,
+		formatResourceRequirements(totalResources),
 	)
 
 	return dataLocation, decision, nil

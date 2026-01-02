@@ -19,16 +19,16 @@ package controller
 import (
 	"context"
 	"fmt"
+	"github.com/go-logr/logr"
 	"io"
-	"net/http"
-	"time"
-
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"net/http"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"time"
 
 	orchestratorv1alpha1 "github.com/vincenzo426/cloudcontinuum-orchestrator/api/v1alpha1"
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/kubeflow"
@@ -38,176 +38,183 @@ import (
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/placement"
 )
 
-// ============================================================================
-// STRUTTURA DEL RECONCILER
-// ============================================================================
+// Costanti di configurazione
+const (
+	requeueDelayShort = 30 * time.Second
+	requeueDelayLong  = 60 * time.Second
+	httpTimeout       = 30 * time.Second
+	runNameTimeFormat = "20060102-150405"
 
-// PipelinePlacementRequestReconciler è il controller principale del CloudContinuum Orchestrator.
-// Gestisce il ciclo di vita delle PipelinePlacementRequest, orchestrando:
-//   - Parsing delle pipeline Kubeflow
-//   - Raccolta metriche dai cluster
-//   - Decisioni di placement usando strategie configurabili
-//   - Deploy ed esecuzione delle pipeline sui cluster target
+	clusterConfigSecretName = "cluster-kubeconfigs"
+	systemNamespace         = "cloudcontinuum-system"
+	kubeflowNamespace       = "kubeflow"
+)
+
+// PipelinePlacementRequestReconciler gestisce il ciclo di vita delle PipelinePlacementRequest.
 type PipelinePlacementRequestReconciler struct {
-	client.Client                                           // Client Kubernetes per il cluster principale
-	Scheme             *runtime.Scheme                      // Schema di runtime per le API
-	pipelineStrategies map[string]pipeline.PipelineStrategy // Strategie di placement disponibili
-	ClusterManager     *multicluster.ClusterManager         // Gestore dei cluster nel continuum
-	MetricsCollector   metrics.Collector                    // Collettore metriche dai cluster
-	pipelineParser     *pipeline.Parser                     // Parser per Kubeflow IR v2.1.0
-	kubeflowManager    *kubeflow.Manager                    // Manager per interazioni con Kubeflow API
+	client.Client
+	Scheme             *runtime.Scheme
+	pipelineStrategies map[string]pipeline.PipelineStrategy
+	ClusterManager     *multicluster.ClusterManager
+	MetricsCollector   metrics.Collector
+	pipelineParser     *pipeline.Parser
+	kubeflowManager    *kubeflow.Manager
 }
 
-// ============================================================================
-// RBAC PERMISSIONS
-// ============================================================================
-// Definisce i permessi necessari per il controller operare correttamente
+// StatusUpdate contiene i dati per l'aggiornamento dello status.
+type StatusUpdate struct {
+	TargetCluster  string
+	Decision       string
+	Resources      *orchestratorv1alpha1.PipelineResourcesSummary
+	RunID          string
+	RunURL         string
+	ExperimentID   string
+	ExperimentName string
+	Parameters     map[string]string
+	Success        bool
+	ErrorMsg       string
+}
 
+// RBAC permissions
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=pipelineplacementrequests,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=pipelineplacementrequests/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=pipelineplacementrequests/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
-// ============================================================================
-// RECONCILIATION LOOP PRINCIPALE
-// ============================================================================
-
-// Reconcile implementa il loop di riconciliazione principale del controller.
-// Questo metodo viene chiamato automaticamente da controller-runtime ogni volta che
-// una PipelinePlacementRequest viene creata, modificata o periodicamente.
-//
-// Flusso di esecuzione (10 step):
-//  1. Recupero della PipelinePlacementRequest dal cluster
-//  2. Verifica idempotenza (skip se già processata)
-//  3. Fetch del YAML della pipeline dalla sorgente specificata
-//  4. Parsing del Kubeflow IR per estrarre metadata e requisiti
-//  5. Raccolta metriche dai cluster disponibili
-//  6. Selezione della strategia di placement
-//  7. Esecuzione della decisione di placement
-//  8. Calcolo delle risorse totali richieste dalla pipeline
-//  9. Deploy e avvio della pipeline sul cluster target via Kubeflow API
-//
-// 10. Aggiornamento dello status con risultati dell'operazione
-//
-// Parametri:
-//   - ctx: context per cancellazione e logging
-//   - req: richiesta di riconciliazione contenente name/namespace della risorsa
-//
-// Ritorna:
-//   - ctrl.Result: indica se e quando ri-eseguire la riconciliazione
-//   - error: errore in caso di fallimento (causa requeue automatico)
+// Reconcile gestisce il ciclo di vita delle PipelinePlacementRequest.
+// Flusso: fetch pipeline → parse → raccolta metriche → placement → deploy → update status
 func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("🔄 Reconciling PipelinePlacementRequest", "name", req.Name, "namespace", req.Namespace)
 
-	// ========================================================================
-	// STEP 1: Recupero della PipelinePlacementRequest
-	// ========================================================================
-	ppr := &orchestratorv1alpha1.PipelinePlacementRequest{}
-	if err := r.Get(ctx, req.NamespacedName, ppr); err != nil {
-		if errors.IsNotFound(err) {
-			logger.Info("✅ PipelinePlacementRequest not found, likely deleted")
-			return ctrl.Result{}, nil
-		}
-		logger.Error(err, "❌ Failed to get PipelinePlacementRequest")
+	// Recupera la risorsa
+	ppr, err := r.fetchPipelinePlacementRequest(ctx, req)
+	if ppr == nil || err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// ========================================================================
-	// STEP 2: Verifica idempotenza - skip se già processata
-	// ========================================================================
-	if ppr.Status.TargetCluster != "" {
-		logger.Info("✅ PipelinePlacementRequest already placed (idempotent skip)",
-			"cluster", ppr.Status.TargetCluster,
-			"runID", ppr.Status.PipelineRunID)
+	// Verifica idempotenza
+	if r.isAlreadyProcessed(ppr, logger) {
 		return ctrl.Result{}, nil
 	}
 
-	// ========================================================================
-	// STEP 3: Fetch del YAML della pipeline
-	// ========================================================================
-	// Supporta tre sorgenti: inline YAML, ConfigMap, HTTP URL
+	// Fetch e parse della pipeline
+	pipelineIR, pipelineYAML, err := r.fetchAndParsePipeline(ctx, ppr)
+	if err != nil {
+		return r.handleError(ctx, ppr, err, "Failed to fetch/parse pipeline", requeueDelayShort)
+	}
+
+	logger.Info("✅ Pipeline parsed", "name", pipelineIR.PipelineInfo.Name, "executors", len(pipelineIR.DeploymentSpec.Executors))
+
+	// Decisione di placement
+	targetCluster, decision, resources, err := r.makePlacementDecision(ctx, ppr, pipelineIR)
+	if err != nil {
+		return r.handleError(ctx, ppr, err, "Placement selection failed", requeueDelayShort)
+	}
+
+	logger.Info("🎯 Placement decision", "strategy", ppr.Spec.PlacementStrategy, "cluster", targetCluster)
+
+	// Esecuzione pipeline su Kubeflow
+	runID, runURL, err := r.executePipeline(ctx, ppr, pipelineIR, targetCluster, pipelineYAML)
+	if err != nil {
+		logger.Error(err, "❌ Failed to execute pipeline")
+		update := StatusUpdate{
+			TargetCluster:  targetCluster,
+			Decision:       decision,
+			Resources:      resources,
+			ExperimentID:   ppr.Spec.ExperimentId,
+			ExperimentName: ppr.Spec.ExperimentName,
+			Parameters:     ppr.Spec.Parameters,
+			Success:        false,
+			ErrorMsg:       fmt.Sprintf("Failed to execute pipeline: %v", err),
+		}
+		r.updateStatus(ctx, ppr, update)
+		return ctrl.Result{RequeueAfter: requeueDelayLong}, err
+	}
+
+	logger.Info("✅ Pipeline executed", "cluster", targetCluster, "runID", runID, "runURL", runURL)
+
+	// Aggiornamento status finale
+	return r.finalizeSuccess(ctx, ppr, targetCluster, decision, resources, runID, runURL)
+}
+
+// fetchPipelinePlacementRequest recupera la risorsa dal cluster.
+func (r *PipelinePlacementRequestReconciler) fetchPipelinePlacementRequest(ctx context.Context, req ctrl.Request) (*orchestratorv1alpha1.PipelinePlacementRequest, error) {
+	logger := log.FromContext(ctx)
+	ppr := &orchestratorv1alpha1.PipelinePlacementRequest{}
+
+	if err := r.Get(ctx, req.NamespacedName, ppr); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("✅ PipelinePlacementRequest not found, likely deleted")
+			return nil, nil
+		}
+		logger.Error(err, "❌ Failed to get PipelinePlacementRequest")
+		return nil, err
+	}
+
+	return ppr, nil
+}
+
+// isAlreadyProcessed verifica se la risorsa è già stata processata (idempotenza).
+func (r *PipelinePlacementRequestReconciler) isAlreadyProcessed(ppr *orchestratorv1alpha1.PipelinePlacementRequest, logger logr.Logger) bool {
+	if ppr.Status.TargetCluster != "" {
+		logger.Info("✅ Already placed (idempotent skip)", "cluster", ppr.Status.TargetCluster, "runID", ppr.Status.PipelineRunID)
+		return true
+	}
+	return false
+}
+
+// fetchAndParsePipeline recupera e parsifica il YAML della pipeline.
+func (r *PipelinePlacementRequestReconciler) fetchAndParsePipeline(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest) (*pipeline.PipelineIR, string, error) {
+	logger := log.FromContext(ctx)
+
 	pipelineYAML, err := r.fetchPipelineYAML(ctx, ppr)
 	if err != nil {
 		logger.Error(err, "❌ Failed to fetch pipeline YAML")
-		r.updateStatus(ctx, ppr, "", "", nil, "", "", "", "", nil, false, "Failed to fetch pipeline YAML")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		return nil, "", fmt.Errorf("fetch YAML: %w", err)
 	}
 
-	logger.V(1).Info("📄 Pipeline YAML fetched successfully",
-		"sourceType", r.getPipelineSourceType(ppr),
-		"size", len(pipelineYAML))
+	logger.V(1).Info("📄 Pipeline YAML fetched", "sourceType", r.getPipelineSourceType(ppr), "size", len(pipelineYAML))
 
-	// ========================================================================
-	// STEP 4: Parsing del Kubeflow Pipeline IR
-	// ========================================================================
-	// Estrae metadata, executors e requisiti di risorse dalla pipeline
 	pipelineIR, err := r.pipelineParser.ParsePipelineIR([]byte(pipelineYAML))
 	if err != nil {
 		logger.Error(err, "❌ Failed to parse pipeline YAML")
-		r.updateStatus(ctx, ppr, "", "", nil, "", "", "", "", ppr.Spec.Parameters, false, "Failed to parse pipeline YAML")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		return nil, "", fmt.Errorf("parse YAML: %w", err)
 	}
 
-	logger.Info("✅ Pipeline parsed successfully",
-		"pipelineName", pipelineIR.PipelineInfo.Name,
-		"executors", len(pipelineIR.DeploymentSpec.Executors),
-		"schemaVersion", pipelineIR.SchemaVersion)
+	return pipelineIR, pipelineYAML, nil
+}
 
-	// ========================================================================
-	// STEP 5: Raccolta metriche dai cluster
-	// ========================================================================
-	// Colleziona CPU, memoria, disponibilità da tutti i cluster
+// makePlacementDecision esegue la strategia di placement e calcola le risorse.
+func (r *PipelinePlacementRequestReconciler) makePlacementDecision(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, pipelineIR *pipeline.PipelineIR) (string, string, *orchestratorv1alpha1.PipelineResourcesSummary, error) {
+	logger := log.FromContext(ctx)
+
+	// Raccolta metriche
 	clusterMetrics, err := r.collectMetrics(ctx)
 	if err != nil {
 		logger.Error(err, "❌ Failed to collect metrics")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		return "", "", nil, err
 	}
 
-	logger.V(1).Info("📊 Cluster metrics collected",
-		"clusters", len(clusterMetrics.Clusters))
+	logger.V(1).Info("📊 Cluster metrics collected", "clusters", len(clusterMetrics.Clusters))
 
-	// ========================================================================
-	// STEP 6: Selezione della strategia di placement
-	// ========================================================================
-	// Strategie disponibili: cloud-only, data-locality, simple-heuristic
+	// Selezione strategia
 	strategy, ok := r.pipelineStrategies[ppr.Spec.PlacementStrategy]
 	if !ok {
 		err := fmt.Errorf("unknown placement strategy: %s", ppr.Spec.PlacementStrategy)
 		logger.Error(err, "❌ Invalid strategy")
-		r.updateStatus(ctx, ppr, "", "", nil, "", "", "", "", ppr.Spec.Parameters, false, "Invalid placement strategy")
-		return ctrl.Result{}, err
+		return "", "", nil, err
 	}
 
-	// ========================================================================
-	// STEP 7: Esecuzione della decisione di placement
-	// ========================================================================
-	// La strategia decide su quale cluster eseguire la pipeline
-	targetCluster, decision, err := strategy.SelectCluster(
-		ctx,
-		pipelineIR,
-		ppr.Spec.DataLocation,
-		clusterMetrics,
-	)
-
+	// Esecuzione placement
+	targetCluster, decision, err := strategy.SelectCluster(ctx, pipelineIR, ppr.Spec.DataLocation, clusterMetrics)
 	if err != nil {
-		logger.Error(err, "❌ Failed to select cluster",
-			"strategy", ppr.Spec.PlacementStrategy)
-		r.updateStatus(ctx, ppr, "", decision, nil, "", "", "", "", ppr.Spec.Parameters, false, "Placement selection failed")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		logger.Error(err, "❌ Failed to select cluster", "strategy", ppr.Spec.PlacementStrategy)
+		return "", "", nil, err
 	}
 
-	logger.Info("🎯 Placement decision made",
-		"strategy", ppr.Spec.PlacementStrategy,
-		"targetCluster", targetCluster,
-		"decision", decision)
-
-	// ========================================================================
-	// STEP 8: Calcolo delle risorse totali della pipeline
-	// ========================================================================
-	// Somma CPU, memoria, GPU di tutti gli executor della pipeline
+	// Calcolo risorse
 	totalResources := pipeline.CalculatePipelineResources(pipelineIR, r.pipelineParser)
-
 	resourcesSummary := &orchestratorv1alpha1.PipelineResourcesSummary{
 		ExecutorCount: totalResources.ExecutorCount,
 		TotalCPU:      totalResources.TotalCPU,
@@ -215,107 +222,92 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 		TotalGPU:      totalResources.TotalGPU,
 	}
 
-	logger.Info("💾 Pipeline resources calculated",
-		"executors", resourcesSummary.ExecutorCount,
-		"totalCPU", resourcesSummary.TotalCPU,
-		"totalMemory", resourcesSummary.TotalMemory,
-		"totalGPU", resourcesSummary.TotalGPU)
+	logger.Info("💾 Pipeline resources", "executors", resourcesSummary.ExecutorCount,
+		"cpu", resourcesSummary.TotalCPU, "memory", resourcesSummary.TotalMemory, "gpu", resourcesSummary.TotalGPU)
 
-	// ========================================================================
-	// STEP 9: Deploy e avvio della pipeline su Kubeflow
-	// ========================================================================
-	// Genera nome univoco per la run usando timestamp
-	runName := fmt.Sprintf("%s-%s", ppr.Name, time.Now().Format("20060102-150405"))
+	return targetCluster, decision, resourcesSummary, nil
+}
 
-	logger.Info("🚀 Triggering pipeline execution on Kubeflow",
-		"cluster", targetCluster,
-		"pipeline", pipelineIR.PipelineInfo.Name,
-		"runName", runName)
+// executePipeline esegue la pipeline sul cluster target tramite Kubeflow API.
+func (r *PipelinePlacementRequestReconciler) executePipeline(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, pipelineIR *pipeline.PipelineIR, targetCluster, pipelineYAML string) (string, string, error) {
+	logger := log.FromContext(ctx)
 
-	// Conversione parametri da map[string]string a map[string]interface{}
+	runName := fmt.Sprintf("%s-%s", ppr.Name, time.Now().Format(runNameTimeFormat))
+
+	logger.Info("🚀 Triggering pipeline execution", "cluster", targetCluster, "pipeline", pipelineIR.PipelineInfo.Name, "runName", runName)
+
+	// Conversione parametri
 	params := make(map[string]interface{})
 	for k, v := range ppr.Spec.Parameters {
 		params[k] = v
 	}
 
-	// Chiama Kubeflow API per upload + creazione run
+	// Chiamata Kubeflow API
 	runID, runURL, err := r.kubeflowManager.UploadAndRunPipeline(
 		ctx,
 		targetCluster,
 		pipelineIR.PipelineInfo.Name,
 		[]byte(pipelineYAML),
 		runName,
-		ppr.Spec.ExperimentId,   // Experiment ID (opzionale)
-		ppr.Spec.ExperimentName, // Experiment name (opzionale)
+		ppr.Spec.ExperimentId,
+		ppr.Spec.ExperimentName,
 		params,
 	)
 
-	if err != nil {
-		logger.Error(err, "❌ Failed to execute pipeline on Kubeflow",
-			"cluster", targetCluster,
-			"pipeline", pipelineIR.PipelineInfo.Name)
+	return runID, runURL, err
+}
 
-		r.updateStatus(ctx, ppr, targetCluster, decision, resourcesSummary, "", "",
-			ppr.Spec.ExperimentId, ppr.Spec.ExperimentName, ppr.Spec.Parameters, false,
-			fmt.Sprintf("Failed to execute pipeline: %v", err))
+// handleError gestisce errori durante la riconciliazione.
+func (r *PipelinePlacementRequestReconciler) handleError(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, err error, msg string, requeueAfter time.Duration) (ctrl.Result, error) {
+	log.FromContext(ctx).Error(err, "❌ "+msg)
 
-		// Retry dopo 60 secondi
-		return ctrl.Result{RequeueAfter: 60 * time.Second}, err
+	update := StatusUpdate{
+		Parameters: ppr.Spec.Parameters,
+		Success:    false,
+		ErrorMsg:   msg,
+	}
+	r.updateStatus(ctx, ppr, update)
+
+	return ctrl.Result{RequeueAfter: requeueAfter}, err
+}
+
+// finalizeSuccess completa con successo la riconciliazione.
+func (r *PipelinePlacementRequestReconciler) finalizeSuccess(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, targetCluster, decision string, resources *orchestratorv1alpha1.PipelineResourcesSummary, runID, runURL string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	update := StatusUpdate{
+		TargetCluster:  targetCluster,
+		Decision:       decision,
+		Resources:      resources,
+		RunID:          runID,
+		RunURL:         runURL,
+		ExperimentID:   ppr.Spec.ExperimentId,
+		ExperimentName: ppr.Spec.ExperimentName,
+		Parameters:     ppr.Spec.Parameters,
+		Success:        true,
 	}
 
-	logger.Info("✅ Pipeline execution triggered successfully",
-		"cluster", targetCluster,
-		"runID", runID,
-		"runURL", runURL)
-
-	// ========================================================================
-	// STEP 10: Aggiornamento dello status con successo
-	// ========================================================================
-	if err := r.updateStatus(ctx, ppr, targetCluster, decision, resourcesSummary,
-		runID, runURL, ppr.Spec.ExperimentId, ppr.Spec.ExperimentName, ppr.Spec.Parameters, true, ""); err != nil {
+	if err := r.updateStatus(ctx, ppr, update); err != nil {
 		logger.Error(err, "❌ Failed to update status")
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("✅ PipelinePlacementRequest reconciled successfully",
-		"cluster", targetCluster,
-		"runID", runID)
-
+	logger.Info("✅ Reconciled successfully", "cluster", targetCluster, "runID", runID)
 	return ctrl.Result{}, nil
 }
 
-// ============================================================================
-// HELPER METHODS - FETCH PIPELINE
-// ============================================================================
-
-// fetchPipelineYAML recupera il contenuto YAML della pipeline dalla sorgente specificata.
-// Supporta tre modalità:
-//  1. Inline: YAML direttamente nel campo spec.pipelineSource.inline
-//  2. ConfigMap: riferimento a ConfigMap (non ancora implementato)
-//  3. URL: download da endpoint HTTP/HTTPS
-//
-// Parametri:
-//   - ctx: context per cancellazione
-//   - ppr: risorsa PipelinePlacementRequest contenente la configurazione sorgente
-//
-// Ritorna:
-//   - string: contenuto YAML della pipeline
-//   - error: errore se nessuna sorgente valida o fetch fallito
-func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(
-	ctx context.Context,
-	ppr *orchestratorv1alpha1.PipelinePlacementRequest,
-) (string, error) {
+// fetchPipelineYAML recupera il YAML della pipeline dalla sorgente configurata.
+// Supporta: inline, ConfigMap (TODO), URL HTTP/HTTPS.
+func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest) (string, error) {
 	source := ppr.Spec.PipelineSource
 
-	// Modalità 1: YAML inline nel CRD
 	if source.Inline != "" {
 		return source.Inline, nil
 	}
 
-	// Modalità 2: ConfigMap reference (TODO: da implementare)
+	// TODO: implementare ConfigMap support
 	// if source.ConfigMapRef != nil { ... }
 
-	// Modalità 3: Download da URL HTTP/HTTPS
 	if source.URL != "" {
 		return r.fetchFromURL(ctx, source.URL)
 	}
@@ -324,39 +316,25 @@ func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(
 }
 
 // fetchFromURL scarica il contenuto YAML da un URL HTTP/HTTPS.
-// Implementa timeout di 30 secondi e validazione status code.
-//
-// Parametri:
-//   - ctx: context per cancellazione
-//   - url: URL completo da cui scaricare il YAML
-//
-// Ritorna:
-//   - string: contenuto scaricato
-//   - error: errore in caso di fallimento HTTP o timeout
 func (r *PipelinePlacementRequestReconciler) fetchFromURL(ctx context.Context, url string) (string, error) {
-	// Crea context con timeout di 30 secondi
-	httpCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	httpCtx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
 
-	// Prepara richiesta HTTP GET
 	req, err := http.NewRequestWithContext(httpCtx, "GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	// Esegui richiesta
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch URL %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
-	// Valida status code (deve essere 200 OK)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP request failed with status %d", resp.StatusCode)
 	}
 
-	// Leggi body completo
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response body: %w", err)
@@ -365,32 +343,14 @@ func (r *PipelinePlacementRequestReconciler) fetchFromURL(ctx context.Context, u
 	return string(body), nil
 }
 
-// ============================================================================
-// HELPER METHODS - METRICS COLLECTION
-// ============================================================================
-
-// collectMetrics raccoglie metriche dai cluster disponibili nel continuum.
-// Utilizza il MetricsCollector configurato per ottenere dati reali su:
-//   - CPU capacity e availability
-//   - Memory capacity e availability
-//   - Stato di disponibilità del cluster
-//
-// In caso di errore nella raccolta, utilizza metriche mock come fallback.
-//
-// Parametri:
-//   - ctx: context per cancellazione
-//
-// Ritorna:
-//   - *placement.ClusterMetrics: metriche aggregate di tutti i cluster
-//   - error: sempre nil (usa fallback in caso di errore)
+// collectMetrics raccoglie metriche dai cluster disponibili.
+// Usa metriche mock come fallback in caso di errore.
 func (r *PipelinePlacementRequestReconciler) collectMetrics(ctx context.Context) (*placement.ClusterMetrics, error) {
 	logger := log.FromContext(ctx)
 
-	// Tenta raccolta metriche reali
 	metrics, err := r.MetricsCollector.CollectMetrics(ctx)
 	if err != nil {
 		logger.Error(err, "⚠️  Failed to collect real metrics, using fallback")
-		// Fallback a metriche mock in caso di errore
 		return r.collectMockMetrics(ctx), nil
 	}
 
@@ -398,70 +358,42 @@ func (r *PipelinePlacementRequestReconciler) collectMetrics(ctx context.Context)
 	return metrics, nil
 }
 
-// collectMockMetrics fornisce metriche di fallback per testing e resilienza.
-// Utilizzato quando la raccolta metriche reali fallisce.
-//
-// Configurazione mock:
-//   - cloud_cluster: 16 CPU, 32GB RAM (potente)
-//   - edge_cluster_1: 4 CPU, 8GB RAM
-//   - edge_cluster_2: 4 CPU, 8GB RAM
-//
-// Parametri:
-//   - ctx: context (non utilizzato)
-//
-// Ritorna:
-//   - *placement.ClusterMetrics: metriche mock pre-configurate
+// collectMockMetrics fornisce metriche di fallback per testing.
 func (r *PipelinePlacementRequestReconciler) collectMockMetrics(ctx context.Context) *placement.ClusterMetrics {
 	metrics := placement.NewClusterMetrics()
 
-	// Cloud cluster: ambiente potente con alte risorse
 	metrics.SetCluster("cloud_cluster", &placement.ClusterMetric{
 		Name:            "cloud_cluster",
-		CPUCapacity:     16000,                   // 16 CPU core (millicores)
-		CPUAvailable:    12000,                   // 12 CPU disponibili
-		MemoryCapacity:  32 * 1024 * 1024 * 1024, // 32GB
-		MemoryAvailable: 24 * 1024 * 1024 * 1024, // 24GB disponibili
+		CPUCapacity:     16000,
+		CPUAvailable:    12000,
+		MemoryCapacity:  32 * 1024 * 1024 * 1024,
+		MemoryAvailable: 24 * 1024 * 1024 * 1024,
 		Available:       true,
 	})
 
-	// Edge cluster 1: risorse limitate
 	metrics.SetCluster("edge_cluster_1", &placement.ClusterMetric{
 		Name:            "edge_cluster_1",
-		CPUCapacity:     4000,                   // 4 CPU core
-		CPUAvailable:    3000,                   // 3 CPU disponibili
-		MemoryCapacity:  8 * 1024 * 1024 * 1024, // 8GB
-		MemoryAvailable: 6 * 1024 * 1024 * 1024, // 6GB disponibili
+		CPUCapacity:     4000,
+		CPUAvailable:    3000,
+		MemoryCapacity:  8 * 1024 * 1024 * 1024,
+		MemoryAvailable: 6 * 1024 * 1024 * 1024,
 		Available:       true,
 	})
 
-	// Edge cluster 2: risorse limitate
 	metrics.SetCluster("edge_cluster_2", &placement.ClusterMetric{
 		Name:            "edge_cluster_2",
-		CPUCapacity:     4000,                   // 4 CPU core
-		CPUAvailable:    2500,                   // 2.5 CPU disponibili
-		MemoryCapacity:  8 * 1024 * 1024 * 1024, // 8GB
-		MemoryAvailable: 5 * 1024 * 1024 * 1024, // 5GB disponibili
+		CPUCapacity:     4000,
+		CPUAvailable:    2500,
+		MemoryCapacity:  8 * 1024 * 1024 * 1024,
+		MemoryAvailable: 5 * 1024 * 1024 * 1024,
 		Available:       true,
 	})
 
 	return metrics
 }
 
-// ============================================================================
-// HELPER METHODS - UTILITY
-// ============================================================================
-
-// getPipelineSourceType ritorna una stringa descrittiva del tipo di sorgente pipeline.
-// Utilizzato per logging e debug.
-//
-// Parametri:
-//   - ppr: risorsa PipelinePlacementRequest
-//
-// Ritorna:
-//   - string: descrizione del tipo di sorgente ("inline", "configmap:...", "url:...", "unknown")
-func (r *PipelinePlacementRequestReconciler) getPipelineSourceType(
-	ppr *orchestratorv1alpha1.PipelinePlacementRequest,
-) string {
+// getPipelineSourceType ritorna il tipo di sorgente per logging.
+func (r *PipelinePlacementRequestReconciler) getPipelineSourceType(ppr *orchestratorv1alpha1.PipelinePlacementRequest) string {
 	source := ppr.Spec.PipelineSource
 
 	if source.Inline != "" {
@@ -476,83 +408,39 @@ func (r *PipelinePlacementRequestReconciler) getPipelineSourceType(
 	return "unknown"
 }
 
-// ============================================================================
-// STATUS UPDATE
-// ============================================================================
+// updateStatus aggiorna lo status della PipelinePlacementRequest.
+func (r *PipelinePlacementRequestReconciler) updateStatus(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, update StatusUpdate) error {
+	ppr.Status.TargetCluster = update.TargetCluster
+	ppr.Status.PlacementDecision = update.Decision
+	ppr.Status.TotalResources = update.Resources
+	ppr.Status.PipelineRunID = update.RunID
+	ppr.Status.PipelineRunURL = update.RunURL
+	ppr.Status.ExperimentId = update.ExperimentID
+	ppr.Status.ExperimentName = update.ExperimentName
+	ppr.Status.Parameters = update.Parameters
 
-// updateStatus aggiorna lo status della PipelinePlacementRequest con i risultati dell'orchestrazione.
-// Gestisce sia casi di successo che di fallimento, aggiornando:
-//   - Cluster target selezionato
-//   - Decisione di placement con motivazione
-//   - Risorse totali della pipeline
-//   - ID e URL della run Kubeflow
-//   - Experiment ID e nome
-//   - Conditions Kubernetes per stato Placed
-//
-// Parametri:
-//   - ctx: context per cancellazione
-//   - ppr: risorsa da aggiornare
-//   - targetCluster: nome del cluster selezionato
-//   - decision: stringa descrittiva della decisione di placement
-//   - resources: summary delle risorse richieste dalla pipeline
-//   - runID: ID univoco della run Kubeflow
-//   - runURL: URL per accedere alla run nella UI
-//   - experimentID: ID dell'experiment Kubeflow
-//   - experimentName: nome dell'experiment
-//   - success: true se placement riuscito, false altrimenti
-//   - errorMsg: messaggio di errore in caso di fallimento
-//
-// Ritorna:
-//   - error: errore in caso di fallimento update API
-func (r *PipelinePlacementRequestReconciler) updateStatus(
-	ctx context.Context,
-	ppr *orchestratorv1alpha1.PipelinePlacementRequest,
-	targetCluster string,
-	decision string,
-	resources *orchestratorv1alpha1.PipelineResourcesSummary,
-	runID string,
-	runURL string,
-	experimentID string,
-	experimentName string,
-	parameters map[string]string,
-	success bool,
-	errorMsg string,
-) error {
-	// Aggiorna campi principali dello status
-	ppr.Status.TargetCluster = targetCluster
-	ppr.Status.PlacementDecision = decision
-	ppr.Status.TotalResources = resources
-	ppr.Status.PipelineRunID = runID
-	ppr.Status.PipelineRunURL = runURL
-	ppr.Status.ExperimentId = experimentID
-	ppr.Status.ExperimentName = experimentName
-	ppr.Status.Parameters = parameters
-
-	// Timestamp del placement
 	now := metav1.Now()
 	ppr.Status.PlacementTime = &now
 
-	// Prepara condition "Placed"
 	condition := metav1.Condition{
 		Type:               "Placed",
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: now,
 		Reason:             "PlacementSuccessful",
-		Message:            decision,
+		Message:            update.Decision,
 	}
 
-	// Modifica condition in caso di fallimento
-	if !success {
+	if !update.Success {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = "PlacementFailed"
-		if errorMsg != "" {
-			condition.Message = errorMsg
+		if update.ErrorMsg != "" {
+			condition.Message = update.ErrorMsg
 		} else {
-			condition.Message = decision
+			condition.Message = update.Decision
 		}
 	}
 
-	// Aggiorna o appendi la condition "Placed"
+	// Aggiorna o appendi condition
 	found := false
 	for i, cond := range ppr.Status.Conditions {
 		if cond.Type == "Placed" {
@@ -565,47 +453,28 @@ func (r *PipelinePlacementRequestReconciler) updateStatus(
 		ppr.Status.Conditions = append(ppr.Status.Conditions, condition)
 	}
 
-	// Persisti lo status aggiornato
 	return r.Status().Update(ctx, ppr)
 }
 
-// ============================================================================
-// CONTROLLER SETUP
-// ============================================================================
-
-// SetupWithManager configura e registra il controller con il Manager.
-// Inizializza tutti i componenti necessari:
-//   - Parser per pipeline Kubeflow IR v2.1.0
-//   - Strategie di placement (cloud-only, data-locality, simple-heuristic)
-//   - ClusterManager per comunicazione multi-cluster
-//   - MetricsCollector per raccolta metriche dai cluster
-//   - KubeflowManager per interazioni con API Kubeflow
-//
-// Questo metodo viene chiamato una volta all'avvio del controller.
-//
-// Parametri:
-//   - mgr: controller-runtime Manager
-//
-// Ritorna:
-//   - error: errore in caso di fallimento inizializzazione
+// SetupWithManager configura il controller con il Manager.
 func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Inizializza parser per Kubeflow Pipeline IR
+	// Inizializza parser
 	r.pipelineParser = pipeline.NewParser()
 
-	// Inizializza strategie di placement disponibili
+	// Inizializza strategie di placement
 	r.pipelineStrategies = map[string]pipeline.PipelineStrategy{
 		"cloud-only-pipeline":       pipeline.NewCloudOnlyPipelineStrategy(),
 		"data-locality-pipeline":    pipeline.NewDataLocalityPipelineStrategy(),
 		"simple-heuristic-pipeline": pipeline.NewSimplePipelineHeuristicStrategy(),
 	}
 
-	// Inizializza ClusterManager per accesso multi-cluster
+	// Inizializza ClusterManager
 	ctx := context.Background()
 	clusterManager, err := multicluster.NewClusterManager(
 		ctx,
 		mgr.GetConfig(),
-		"cluster-kubeconfigs",   // Nome del Secret con kubeconfig
-		"cloudcontinuum-system", // Namespace del Secret
+		clusterConfigSecretName,
+		systemNamespace,
 		mgr.GetScheme(),
 	)
 	if err != nil {
@@ -613,23 +482,21 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	}
 	r.ClusterManager = clusterManager
 
-	// Inizializza MetricsCollector per raccolta metriche reali
+	// Inizializza MetricsCollector
 	metricsCollector := metrics.NewRealMetricsCollector(
 		clusterManager.ClusterClients,
 		metrics.DefaultConfig(),
 	)
 	r.MetricsCollector = metricsCollector
-	metricsCollector.Start(ctx) // Avvia goroutine di raccolta periodica
+	metricsCollector.Start(ctx)
 
-	// Inizializza KubeflowManager per interazioni con API
-	r.kubeflowManager = kubeflow.NewManager("kubeflow") // Namespace Kubeflow
+	// Inizializza KubeflowManager
+	r.kubeflowManager = kubeflow.NewManager(kubeflowNamespace)
 
-	// Log configurazione
 	ctrl.Log.Info("✅ PipelinePlacementRequest controller initialized",
 		"clusters", clusterManager.ListClusters(),
 		"strategies", len(r.pipelineStrategies))
 
-	// Registra controller con Manager
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&orchestratorv1alpha1.PipelinePlacementRequest{}).
 		Named("pipelineplacementrequest").
