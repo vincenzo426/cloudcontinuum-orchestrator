@@ -20,7 +20,14 @@ import (
 	"context"
 	"fmt"
 	"github.com/go-logr/logr"
+	orchestratorv1alpha1 "github.com/vincenzo426/cloudcontinuum-orchestrator/api/v1alpha1"
+	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/kubeflow"
+	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/metrics"
+	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/multicluster"
+	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/pipeline"
+	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/placement"
 	"io"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,13 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"time"
-
-	orchestratorv1alpha1 "github.com/vincenzo426/cloudcontinuum-orchestrator/api/v1alpha1"
-	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/kubeflow"
-	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/metrics"
-	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/multicluster"
-	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/pipeline"
-	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/placement"
 )
 
 // Costanti di configurazione
@@ -305,8 +305,9 @@ func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(ctx context.Conte
 		return source.Inline, nil
 	}
 
-	// TODO: implementare ConfigMap support
-	// if source.ConfigMapRef != nil { ... }
+	if source.ConfigMapRef != nil {
+		return r.fetchFromConfigMap(ctx, ppr.Namespace, source.ConfigMapRef)
+	}
 
 	if source.URL != "" {
 		return r.fetchFromURL(ctx, source.URL)
@@ -341,6 +342,42 @@ func (r *PipelinePlacementRequestReconciler) fetchFromURL(ctx context.Context, u
 	}
 
 	return string(body), nil
+}
+
+// fetchFromConfigMap recupera il contenuto YAML da una ConfigMap.
+func (r *PipelinePlacementRequestReconciler) fetchFromConfigMap(
+	ctx context.Context,
+	namespace string,
+	configMapRef *orchestratorv1alpha1.ConfigMapReference,
+) (string, error) {
+	logger := log.FromContext(ctx)
+
+	configMap := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{
+		Name:      configMapRef.Name,
+		Namespace: namespace,
+	}, configMap)
+
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return "", fmt.Errorf("configmap %s/%s not found", namespace, configMapRef.Name)
+		}
+		return "", fmt.Errorf("failed to get configmap: %w", err)
+	}
+
+	// Estrai il contenuto dalla chiave specificata
+	content, ok := configMap.Data[configMapRef.Key]
+	if !ok {
+		return "", fmt.Errorf("key %s not found in configmap %s/%s",
+			configMapRef.Key, namespace, configMapRef.Name)
+	}
+
+	logger.V(1).Info("📄 Pipeline YAML loaded from ConfigMap",
+		"configmap", configMapRef.Name,
+		"key", configMapRef.Key,
+		"size", len(content))
+
+	return content, nil
 }
 
 // collectMetrics raccoglie metriche dai cluster disponibili.
