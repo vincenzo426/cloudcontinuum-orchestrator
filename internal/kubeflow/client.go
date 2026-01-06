@@ -7,17 +7,19 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"strings"
+	"net/url"
+	//"strings"
 	"time"
 )
 
 // Costanti per gli endpoint API
 const (
-	apiBase        = "/apis/v1beta1"
-	endpointUpload = apiBase + "/pipelines/upload"
-	endpointPipes  = apiBase + "/pipelines"
-	endpointExps   = apiBase + "/experiments"
-	endpointRuns   = apiBase + "/runs"
+	apiBase               = "/apis/v1beta1"
+	endpointUpload        = apiBase + "/pipelines/upload"
+	endpointUploadVersion = apiBase + "/pipelines/upload_version"
+	endpointPipes         = apiBase + "/pipelines"
+	endpointExps          = apiBase + "/experiments"
+	endpointRuns          = apiBase + "/runs"
 )
 
 // Client gestisce le chiamate HTTP alle API di Kubeflow Pipelines.
@@ -147,6 +149,81 @@ func (c *Client) UploadPipeline(name string, pipelineYAML []byte) (string, error
 	return uploadResp.ID, nil
 }
 
+// UploadPipelineVersion carica una nuova versione di una pipeline esistente.
+// Usa l'endpoint /apis/v1beta1/pipelines/upload_version
+func (c *Client) UploadPipelineVersion(pipelineID, versionName string, pipelineYAML []byte) (string, error) {
+	var requestBody bytes.Buffer
+	writer := multipart.NewWriter(&requestBody)
+
+	// 1. Crea part per il file
+	part, err := writer.CreateFormFile("uploadfile", versionName+".yaml")
+	if err != nil {
+		return "", fmt.Errorf("create form file error: %w", err)
+	}
+	if _, err := part.Write(pipelineYAML); err != nil {
+		return "", fmt.Errorf("write yaml error: %w", err)
+	}
+
+	// 2. Aggiungi campi al Body (Multipart)
+	// Nota: Alcune versioni di KFP richiedono "description" per non andare in panic
+	fields := map[string]string{
+		"name":        versionName,
+		"pipelineid":  pipelineID,
+		"description": "Uploaded by Cloud Continuum Orchestrator", // Campo spesso obbligatorio per evitare bug backend
+	}
+
+	for key, val := range fields {
+		if err := writer.WriteField(key, val); err != nil {
+			return "", fmt.Errorf("write field %s error: %w", key, err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+
+	// 3. Costruisci l'URL con Query Parameters
+	// Molte implementazioni del server KFP leggono 'pipelineid' dalla query string prima del body
+	reqURL, err := url.Parse(c.BaseURL + endpointUploadVersion)
+	if err != nil {
+		return "", fmt.Errorf("invalid base URL: %w", err)
+	}
+
+	q := reqURL.Query()
+	q.Add("name", versionName)
+	q.Add("pipelineid", pipelineID)
+	// q.Add("description", ...) // Opzionale in query, ma essenziale averlo nel body o qui
+	reqURL.RawQuery = q.Encode()
+
+	// 4. Crea la richiesta
+	req, err := http.NewRequest("POST", reqURL.String(), &requestBody)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	c.addAuth(req)
+
+	// 5. Esegui
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("upload version request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("upload version failed status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var versionResp PipelineVersionResponse
+	if err := json.Unmarshal(body, &versionResp); err != nil {
+		return "", fmt.Errorf("parse version response error: %w", err)
+	}
+
+	return versionResp.ID, nil
+}
+
 // GetPipelineByName cerca una pipeline per nome.
 func (c *Client) GetPipelineByName(name string) (string, error) {
 	var listResp PipelineListResponse
@@ -162,13 +239,13 @@ func (c *Client) GetPipelineByName(name string) (string, error) {
 	return "", fmt.Errorf("pipeline %s not found", name)
 }
 
-// UploadOrVersionPipeline gestisce la logica di creazione o versionamento.
+// UploadOrVersionPipeline gestisce la logica di creazione o versionamento usando API native.
 func (c *Client) UploadOrVersionPipeline(pipelineName string, pipelineYAML []byte) (pipelineID, versionID string, err error) {
 	existingID, err := c.GetPipelineByName(pipelineName)
 
 	if err != nil {
 		// Pipeline non trovata -> Creazione nuova
-		fmt.Printf("Creating new pipeline: %s\n", pipelineName)
+		fmt.Printf("[KUBEFLOW] Creating new pipeline: %s\n", pipelineName)
 		pid, err := c.UploadPipeline(pipelineName, pipelineYAML)
 		if err != nil {
 			return "", "", err
@@ -176,18 +253,20 @@ func (c *Client) UploadOrVersionPipeline(pipelineName string, pipelineYAML []byt
 		return pid, "", nil
 	}
 
-	// Pipeline trovata -> Creazione nuova versione (nome con timestamp)
-	fmt.Printf("Pipeline found (%s). Creating versioned pipeline.\n", existingID)
+	// Pipeline trovata -> Creazione nuova versione tramite API nativa
+	fmt.Printf("[KUBEFLOW] Pipeline found (%s). Creating new version using native API.\n", existingID)
 
-	baseName := strings.TrimSuffix(pipelineName, ".yaml")
-	versionedName := fmt.Sprintf("%s-v%s.yaml", baseName, time.Now().Format("20060102-150405"))
+	// Genera nome versione con timestamp
+	versionName := fmt.Sprintf("v%s", time.Now().Format("20060102-150405"))
 
-	newID, err := c.UploadPipeline(versionedName, pipelineYAML)
+	versionID, err = c.UploadPipelineVersion(existingID, versionName, pipelineYAML)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to upload versioned pipeline: %w", err)
+		return "", "", fmt.Errorf("failed to upload pipeline version: %w", err)
 	}
 
-	return newID, newID, nil
+	fmt.Printf("[KUBEFLOW] Version created successfully: %s (parent pipeline: %s)\n", versionID, existingID)
+
+	return existingID, versionID, nil
 }
 
 // ============================================================================
@@ -262,10 +341,11 @@ func (c *Client) CreateRun(pipelineID, versionID, runName, experimentID string, 
 		PipelineID: pipelineID,
 		Parameters: params,
 	}
+	// Se esiste versionID, usalo (versione specifica)
 	if versionID != "" {
 		pipelineSpec.PipelineVersionID = versionID
 	}
-
+	// Altrimenti Kubeflow userà la versione default/latest
 	runReq := RunRequest{
 		Name:         runName,
 		Description:  "Run created by Cloud Continuum Orchestrator",

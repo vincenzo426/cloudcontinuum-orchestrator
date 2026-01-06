@@ -22,6 +22,23 @@ type PipelineListResponse struct {
 	NextPageToken string                   `json:"next_page_token"`
 }
 
+// PipelineVersionResponse rappresenta una versione di pipeline.
+type PipelineVersionResponse struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	CreatedAt   time.Time `json:"created_at"`
+	Description string    `json:"description"`
+	PipelineID  string    `json:"pipeline_id"`
+	Error       string    `json:"error,omitempty"`
+}
+
+// PipelineVersionListResponse per listare versioni di una pipeline.
+type PipelineVersionListResponse struct {
+	Versions      []PipelineVersionResponse `json:"versions"`
+	TotalSize     int                       `json:"total_size"`
+	NextPageToken string                    `json:"next_page_token"`
+}
+
 // ============================================================================
 // STRUTTURE EXPERIMENT
 // ============================================================================
