@@ -270,6 +270,7 @@ rules:
   resources:
   - configmaps
   - nodes
+  - secrets
   verbs:
   - get
   - list
@@ -286,14 +287,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
-  - watch  // <-- AGGIUNGI QUESTA RIGA
 - apiGroups:
   - orchestrator.cloudcontinuum.io
   resources:
@@ -518,7 +511,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: cenzo104/cloudcontinuum-orchestrator:v1.0.1
+        image: cenzo104/cloudcontinuum-orchestrator:v5.0.8
         livenessProbe:
           httpGet:
             path: /healthz

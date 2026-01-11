@@ -3,12 +3,19 @@ package kubeflow
 import (
 	"context"
 	"fmt"
-
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
-	defaultExperimentName = "cloudcontinuum-default"
+	defaultProfileNamespace = "kubeflow-user-example-com"
+	defaultExperimentName   = "cloudcontinuum-default"
+	authSecretName          = "kubeflow-auth-tokens"
+	authSecretNamespace     = "cloudcontinuum-orchestrator-system"
 )
 
 // Manager gestisce i client Kubeflow per cluster multipli nel CloudContinuum.
@@ -18,19 +25,89 @@ type Manager struct {
 }
 
 // NewManager crea e inizializza un nuovo Manager configurato con i client per tutti i cluster.
-func NewManager(namespace string) *Manager {
+func NewManager(ctx context.Context, config *rest.Config, scheme *runtime.Scheme) (*Manager, error) {
+	logger := log.FromContext(ctx)
+
+	// Crea un DIRECT client (non-cached) per leggere il Secret
+	directClient, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create direct client: %w", err)
+	}
+
+	// Carica i token dal Secret usando il direct client
+	tokens, err := loadAuthTokens(ctx, directClient)
+	if err != nil {
+		logger.Error(err, "Failed to load auth tokens, using standalone mode")
+		// Fallback a standalone mode
+		tokens = getEmptyTokens()
+	}
+
 	clients := make(map[string]*Client)
 	endpoints := getKubeflowEndpoints()
 
 	// Inizializza i client per ogni endpoint disponibile
 	for name, url := range endpoints {
-		// Nota: Token vuoto per modalità standalone
-		clients[name] = NewClient(url, namespace, "")
+		token := tokens[name]
+		clients[name] = NewClient(url, defaultProfileNamespace, token)
+
+		if token != "" {
+			logger.Info("Kubeflow client initialized with authentication",
+				"cluster", name,
+				"profile", defaultProfileNamespace,
+				"mode", "multi-user")
+		} else {
+			logger.Info("Kubeflow client initialized without authentication",
+				"cluster", name,
+				"mode", "standalone")
+		}
 	}
 
 	return &Manager{
 		clients:   clients,
-		namespace: namespace,
+		namespace: defaultProfileNamespace,
+	}, nil
+}
+
+// loadAuthTokens carica i token dal Secret Kubernetes usando un direct client
+func loadAuthTokens(ctx context.Context, k8sClient client.Client) (map[string]string, error) {
+	logger := log.FromContext(ctx)
+
+	secret := &corev1.Secret{}
+	err := k8sClient.Get(ctx, types.NamespacedName{
+		Name:      authSecretName,
+		Namespace: authSecretNamespace,
+	}, secret)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get auth secret: %w", err)
+	}
+
+	tokens := make(map[string]string)
+	for key, value := range secret.Data {
+		tokenStr := string(value)
+		if tokenStr != "" {
+			tokens[key] = tokenStr
+			logger.Info("Token loaded from secret",
+				"cluster", key,
+				"tokenLength", len(tokenStr))
+		}
+	}
+
+	if len(tokens) == 0 {
+		logger.Info("Secret found but contains no valid tokens")
+		return getEmptyTokens(), nil
+	}
+
+	return tokens, nil
+}
+
+// getEmptyTokens ritorna una mappa di token vuoti (modalità standalone)
+func getEmptyTokens() map[string]string {
+	return map[string]string{
+		"cloud_cluster":  "",
+		"edge_cluster_1": "",
+		"edge_cluster_2": "",
+		"edge_cluster_3": "",
 	}
 }
 

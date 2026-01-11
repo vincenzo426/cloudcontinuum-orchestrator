@@ -67,6 +67,7 @@ type PipelinePlacementRequestReconciler struct {
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=pipelineplacementrequests/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=pipelineplacementrequests/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile gestisce il ciclo di vita delle PipelinePlacementRequest.
 func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -416,7 +417,12 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	r.MetricsCollector = metricsCollector
 	metricsCollector.Start(ctx)
 
-	r.kubeflowManager = kubeflow.NewManager(kubeflowNamespace)
+	// Kubeflow Manager
+	kubeflowMgr, err := kubeflow.NewManager(ctx, mgr.GetConfig(), mgr.GetScheme())
+	if err != nil {
+		return fmt.Errorf("failed to initialize kubeflow manager: %w", err)
+	}
+	r.kubeflowManager = kubeflowMgr
 
 	ctrl.Log.Info("[INIT] PipelinePlacementRequest controller initialized", "clusters", clusterManager.ListClusters(), "strategies", len(r.pipelineStrategies))
 

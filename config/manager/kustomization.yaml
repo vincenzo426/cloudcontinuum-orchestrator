@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: cenzo104/cloudcontinuum-orchestrator
-  newTag: v1.0.1
+  newTag: v5.0.8

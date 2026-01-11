@@ -42,9 +42,17 @@ func NewClient(baseURL, namespace, token string) *Client {
 	}
 }
 
-// addAuth aggiunge gli header di autenticazione (placeholder per implementazioni future).
+// addAuth aggiunge gli header di autenticazione (per multi-user mode)
 func (c *Client) addAuth(req *http.Request) {
-	// In modalità multi-user, qui andrebbe aggiunto il Bearer token
+	if c.Token != "" {
+		// Bearer token per autenticazione
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+
+		// CRITICO per multi-user: specifica il namespace del Profile
+		// Kubeflow usa questo header per determinare dove creare le risorse
+		req.Header.Set("kubeflow-userid", c.Namespace)
+	}
+	// In modalità standalone (Token vuoto), non aggiungiamo header
 }
 
 // doRequest gestisce la logica comune delle chiamate HTTP JSON.
@@ -143,7 +151,7 @@ func (c *Client) UploadPipeline(name string, pipelineYAML []byte) (string, error
 
 	var uploadResp PipelineUploadResponse
 	if err := json.Unmarshal(body, &uploadResp); err != nil {
-		return "", fmt.Errorf("parse error: %w", err)
+		return "", fmt.Errorf("parse error: %w\nResponse body: %s", err, string(body))
 	}
 
 	return uploadResp.ID, nil

@@ -9,6 +9,7 @@ rules:
   resources:
   - configmaps
   - nodes
+  - secrets
   verbs:
   - get
   - list
@@ -25,14 +26,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
-  - watch  // <-- AGGIUNGI QUESTA RIGA
 - apiGroups:
   - orchestrator.cloudcontinuum.io
   resources:

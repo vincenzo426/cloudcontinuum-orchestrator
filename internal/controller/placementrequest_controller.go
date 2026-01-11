@@ -57,7 +57,7 @@ type PlacementRequestReconciler struct {
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=placementrequests/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch  // <-- AGGIUNGI QUESTA RIGA
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *PlacementRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
