@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	orchestratorv1alpha1 "github.com/vincenzo426/cloudcontinuum-orchestrator/api/v1alpha1"
+	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/datatransfer"
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/kubeflow"
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/metrics"
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/multicluster"
@@ -60,6 +61,7 @@ type PipelinePlacementRequestReconciler struct {
 	MetricsCollector   metrics.Collector
 	pipelineParser     *pipeline.Parser
 	kubeflowManager    *kubeflow.Manager
+	transferCalculator *datatransfer.Calculator
 }
 
 // RBAC permissions
@@ -99,9 +101,9 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 	logger.Info("[PARSE] Pipeline parsed", "name", pipelineIR.PipelineInfo.Name, "executors", len(pipelineIR.DeploymentSpec.Executors))
 
 	// Decisione placement
-	targetCluster, decision, resources, err := r.makePlacementDecision(ctx, ppr, pipelineIR)
+	targetCluster, decision, resources, transferInfo, err := r.makePlacementDecision(ctx, ppr, pipelineIR)
 	if err != nil {
-		return r.failWithStatus(ctx, ppr, err, "Placement selection failed", requeueDelayShort)
+		return r.failWithStatus(ctx, ppr, err, decision, requeueDelayShort)
 	}
 
 	logger.Info("[PLACEMENT] Decision made", "strategy", ppr.Spec.PlacementStrategy, "cluster", targetCluster)
@@ -115,7 +117,7 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 	logger.Info("[SUCCESS] Pipeline deployed", "cluster", targetCluster, "runID", runID)
 
 	// Update status finale
-	return r.updateStatusAndComplete(ctx, ppr, targetCluster, decision, resources, runID, runURL, true, "")
+	return r.updateStatusAndComplete(ctx, ppr, targetCluster, decision, resources, transferInfo, runID, runURL, true, "")
 }
 
 // fetchAndParsePipeline recupera e parsifica il YAML della pipeline.
@@ -150,13 +152,17 @@ func (r *PipelinePlacementRequestReconciler) fetchAndParsePipeline(ctx context.C
 }
 
 // makePlacementDecision esegue la strategia di placement e calcola le risorse.
-func (r *PipelinePlacementRequestReconciler) makePlacementDecision(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, pipelineIR *pipeline.PipelineIR) (string, string, *orchestratorv1alpha1.PipelineResourcesSummary, error) {
+func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
+	ctx context.Context,
+	ppr *orchestratorv1alpha1.PipelinePlacementRequest,
+	pipelineIR *pipeline.PipelineIR,
+) (string, string, *orchestratorv1alpha1.PipelineResourcesSummary, *datatransfer.TransferInfo, error) {
 	logger := log.FromContext(ctx)
 
 	// Raccolta metriche
 	clusterMetrics, err := r.collectMetrics(ctx)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, nil, err
 	}
 
 	logger.V(1).Info("[METRICS] Collected", "clusters", len(clusterMetrics.Clusters))
@@ -164,29 +170,40 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(ctx context.C
 	// Selezione strategia
 	strategy, ok := r.pipelineStrategies[ppr.Spec.PlacementStrategy]
 	if !ok {
-		return "", "", nil, fmt.Errorf("unknown placement strategy: %s", ppr.Spec.PlacementStrategy)
+		return "", "", nil, nil, fmt.Errorf("unknown placement strategy: %s", ppr.Spec.PlacementStrategy)
 	}
 
 	// Esecuzione placement
 	targetCluster, decision, err := strategy.SelectCluster(ctx, pipelineIR, ppr.Spec.DataLocation, clusterMetrics)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("cluster selection failed: %w", err)
+		return "", decision, nil, nil, fmt.Errorf("cluster selection failed: %w", err)
 	}
 
 	// Calcolo risorse
 	totalResources := pipeline.CalculatePipelineResources(pipelineIR, r.pipelineParser)
+
+	// 5. Calcolo trasferimento dati (UNIFORMEMENTE per tutte le strategie!)
+	transferInfo := r.calculateDataTransfer(
+		ppr.Spec.DataLocation,
+		targetCluster,
+		ppr.Spec.DataSize,
+		clusterMetrics,
+	)
 
 	// Log summary dettagliato (usa NewPipelinePlacement e Summary)
 	placementResult := pipeline.NewPipelinePlacement(targetCluster, decision, totalResources)
 	logger.Info("[PLACEMENT] Complete",
 		"cluster", targetCluster,
 		"strategy", ppr.Spec.PlacementStrategy,
+		"transferTime", fmt.Sprintf("%dms", transferInfo.TransferTime),
 		"executors", totalResources.ExecutorCount,
 		"cpuCores", fmt.Sprintf("%.2f", float64(totalResources.TotalCPU)/1000.0))
 	logger.V(1).Info("[DEBUG] Placement details\n" + placementResult.Summary())
-
+	if transferInfo.TransferTime > 0 {
+		logger.Info("[DATA TRANSFER]", "details", transferInfo.TransferDetails)
+	}
 	// Converti per CRD
-	return targetCluster, decision, r.toResourcesSummary(totalResources), nil
+	return targetCluster, decision, r.toResourcesSummary(totalResources), transferInfo, nil
 }
 
 // executePipeline esegue la pipeline sul cluster target.
@@ -311,14 +328,22 @@ func (r *PipelinePlacementRequestReconciler) mockMetrics() *placement.ClusterMet
 }
 
 // failWithStatus gestisce errori aggiornando lo status.
-func (r *PipelinePlacementRequestReconciler) failWithStatus(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, err error, msg string, requeueAfter time.Duration) (ctrl.Result, error) {
-	log.FromContext(ctx).Error(err, "[ERROR] "+msg)
-	r.updateStatusAndComplete(ctx, ppr, "", "", nil, "", "", false, msg)
+func (r *PipelinePlacementRequestReconciler) failWithStatus(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, err error, decision string, requeueAfter time.Duration) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Error(err, "[ERROR] Placement failed", "decision", decision)
+
+	// Combina il messaggio di errore con la decision per fornire dettagli completi
+	fullMessage := decision
+	if fullMessage == "" {
+		fullMessage = err.Error()
+	}
+
+	r.updateStatusAndComplete(ctx, ppr, "", decision, nil, nil, "", "", false, fullMessage)
 	return ctrl.Result{RequeueAfter: requeueAfter}, err
 }
 
 // updateStatusAndComplete aggiorna lo status e completa la riconciliazione.
-func (r *PipelinePlacementRequestReconciler) updateStatusAndComplete(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, targetCluster, decision string, resources *orchestratorv1alpha1.PipelineResourcesSummary, runID, runURL string, success bool, errorMsg string) (ctrl.Result, error) {
+func (r *PipelinePlacementRequestReconciler) updateStatusAndComplete(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, targetCluster, decision string, resources *orchestratorv1alpha1.PipelineResourcesSummary, transferInfo *datatransfer.TransferInfo, runID, runURL string, success bool, errorMsg string) (ctrl.Result, error) {
 	ppr.Status.TargetCluster = targetCluster
 	ppr.Status.PlacementDecision = decision
 	ppr.Status.TotalResources = resources
@@ -327,6 +352,13 @@ func (r *PipelinePlacementRequestReconciler) updateStatusAndComplete(ctx context
 	ppr.Status.ExperimentId = ppr.Spec.ExperimentId
 	ppr.Status.ExperimentName = ppr.Spec.ExperimentName
 	ppr.Status.Parameters = ppr.Spec.Parameters
+
+	// Aggiungi informazioni trasferimento dati
+	if transferInfo != nil {
+		ppr.Status.DataTransferLatency = transferInfo.NetworkLatency
+		ppr.Status.DataTransferTime = transferInfo.TransferTime
+		ppr.Status.DataTransferDetails = transferInfo.TransferDetails
+	}
 
 	now := metav1.Now()
 	ppr.Status.PlacementTime = &now
@@ -365,7 +397,7 @@ func (r *PipelinePlacementRequestReconciler) updateStatusAndComplete(ctx context
 	}
 
 	if success {
-		log.FromContext(ctx).Info("[SUCCESS] Reconciled", "cluster", targetCluster, "runID", runID)
+		log.FromContext(ctx).Info("[SUCCESS] Reconciled", "cluster", targetCluster, "runID", runID, "transferTime", fmt.Sprintf("%dms", transferInfo.TransferTime))
 	}
 
 	return ctrl.Result{}, nil
@@ -396,6 +428,78 @@ func (r *PipelinePlacementRequestReconciler) toResourcesSummary(res pipeline.Pip
 	}
 }
 
+// calculateDataTransfer - UNICA funzione per il calcolo trasferimento
+func (r *PipelinePlacementRequestReconciler) calculateDataTransfer(
+	dataLocation, targetCluster, dataSize string,
+	metrics *placement.ClusterMetrics,
+) *datatransfer.TransferInfo {
+
+	// Caso 1: Nessun trasferimento necessario
+	if dataLocation == "" || dataLocation == "none" || dataLocation == targetCluster {
+		return datatransfer.NoTransferNeeded()
+	}
+
+	// Caso 2: Usa dataSize di default se non specificato
+	if dataSize == "" {
+		dataSize = "1GB"
+	}
+
+	// Caso 3: Ottieni latenza di rete
+	networkLatency := r.getNetworkLatency(dataLocation, targetCluster, metrics)
+
+	// Caso 4: Calcola tempo totale trasferimento
+	if r.transferCalculator != nil {
+		result, err := r.transferCalculator.CalculateTransferTime(
+			dataLocation, targetCluster, dataSize, networkLatency,
+		)
+		if err == nil {
+			return &datatransfer.TransferInfo{
+				SourceCluster:   dataLocation,
+				TargetCluster:   targetCluster,
+				DataSize:        dataSize,
+				NetworkLatency:  result.NetworkLatency,
+				TransferTime:    result.DataTransferTime,
+				TransferDetails: result.TransferDetails,
+			}
+		}
+	}
+
+	// Fallback: solo latenza di rete
+	return &datatransfer.TransferInfo{
+		SourceCluster:  dataLocation,
+		TargetCluster:  targetCluster,
+		DataSize:       dataSize,
+		NetworkLatency: networkLatency,
+		TransferTime:   networkLatency,
+		TransferDetails: fmt.Sprintf("Data transfer from %s to %s (network latency only: %d ms)",
+			dataLocation, targetCluster, networkLatency),
+	}
+}
+
+// getNetworkLatency - helper
+func (r *PipelinePlacementRequestReconciler) getNetworkLatency(
+	source, target string,
+	metrics *placement.ClusterMetrics,
+) int64 {
+	sourceMetric := metrics.GetCluster(source)
+	if sourceMetric == nil {
+		return 9999
+	}
+
+	switch target {
+	case "edge_cluster_1":
+		return sourceMetric.LatencyToEdge1
+	case "edge_cluster_2":
+		return sourceMetric.LatencyToEdge2
+	case "edge_cluster_3":
+		return sourceMetric.LatencyToEdge3
+	case "cloud_cluster":
+		return sourceMetric.LatencyToCloud
+	default:
+		return 9999
+	}
+}
+
 // SetupWithManager configura il controller.
 func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.pipelineParser = pipeline.NewParser()
@@ -407,6 +511,14 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	}
 
 	ctx := context.Background()
+
+	// Inizializza transfer calculator
+	transferCalc, err := datatransfer.NewCalculator(ctx, mgr.GetClient())
+	if err != nil {
+		ctrl.Log.Error(err, "Failed to initialize data transfer calculator")
+	}
+	r.transferCalculator = transferCalc
+
 	clusterManager, err := multicluster.NewClusterManager(ctx, mgr.GetConfig(), clusterConfigSecretName, systemNamespace, mgr.GetScheme())
 	if err != nil {
 		return fmt.Errorf("failed to initialize cluster manager: %w", err)

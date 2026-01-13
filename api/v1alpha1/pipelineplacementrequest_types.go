@@ -36,6 +36,11 @@ type PipelinePlacementRequestSpec struct {
 	// +optional
 	DataLocation string `json:"dataLocation,omitempty"`
 
+	// DataSize specifies the size of data to transfer (e.g., "5GB", "500MB")
+	// Used for simulating data transfer time when pipeline is placed away from data location
+	// +optional
+	DataSize string `json:"dataSize,omitempty"`
+
 	// ExperimentId specifies the Kubeflow experiment to use for pipeline runs
 	// If empty, a default experiment will be created/used
 	// +optional
@@ -144,6 +149,19 @@ type PipelinePlacementRequestStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// DataTransferLatency is the network latency in milliseconds
+	// +optional
+	DataTransferLatency int64 `json:"dataTransferLatency,omitempty"`
+
+	// DataTransferTime is the total data transfer time in milliseconds
+	// Includes both network latency and actual data transfer based on bandwidth
+	// +optional
+	DataTransferTime int64 `json:"dataTransferTime,omitempty"`
+
+	// DataTransferDetails provides human-readable information about data transfer calculation
+	// +optional
+	DataTransferDetails string `json:"dataTransferDetails,omitempty"`
 }
 
 // +kubebuilder:object:root=true

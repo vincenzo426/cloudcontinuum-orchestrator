@@ -63,6 +63,11 @@ spec:
                 - cloud_cluster
                 - none
                 type: string
+              dataSize:
+                description: |-
+                  DataSize specifies the size of data to transfer (e.g., "5GB", "500MB")
+                  Used for simulating data transfer time when pipeline is placed away from data location
+                type: string
               experimentId:
                 description: |-
                   ExperimentId specifies the Kubeflow experiment to use for pipeline runs
@@ -192,6 +197,20 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              dataTransferDetails:
+                description: DataTransferDetails provides human-readable information
+                  about data transfer calculation
+                type: string
+              dataTransferLatency:
+                description: DataTransferLatency is the network latency in milliseconds
+                format: int64
+                type: integer
+              dataTransferTime:
+                description: |-
+                  DataTransferTime is the total data transfer time in milliseconds
+                  Includes both network latency and actual data transfer based on bandwidth
+                format: int64
+                type: integer
               experimentId:
                 description: ExperimentId used for the run
                 type: string

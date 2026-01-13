@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-transfer-config
+  namespace: cloudcontinuum-system
+data:
+  # Velocità di trasferimento in Mbps
+  # Cloud ↔ Edge: 100 Mbps (connessioni WAN)
+  cloud_cluster-edge_cluster_1: "100"
+  edge_cluster_1-cloud_cluster: "100"
+  cloud_cluster-edge_cluster_2: "100"
+  edge_cluster_2-cloud_cluster: "100"
+  cloud_cluster-edge_cluster_3: "100"
+  edge_cluster_3-cloud_cluster: "100"
+  
+  # Edge ↔ Edge: 1000 Mbps (1 Gbps - connessioni LAN)
+  edge_cluster_1-edge_cluster_2: "1000"
+  edge_cluster_2-edge_cluster_1: "1000"
+  edge_cluster_1-edge_cluster_3: "1000"
+  edge_cluster_3-edge_cluster_1: "1000"
+  edge_cluster_2-edge_cluster_3: "1000"
+  edge_cluster_3-edge_cluster_2: "1000"
+  
+  # Valore di default per connessioni non specificate
+  default-bandwidth: "100"
