@@ -25,6 +25,44 @@ class ClusterConfig:
     baseline_cpu_used: int = 0
     baseline_memory_used: int = 0
 
+# =============================================================================
+# CORREZIONE: Definisci DEFAULT_CLUSTERS a livello globale per l'export
+# =============================================================================
+DEFAULT_CLUSTERS = [
+    ClusterConfig(
+        name="cloud_cluster",
+        cpu_capacity=6000,            # 6 cores
+        memory_capacity=16739684352,  # ~16GB (dal log)
+        cluster_type="cloud",
+        baseline_cpu_used=3715,       # 62% utilizzato (dal log)
+        baseline_memory_used=9189720064  # ~8.6GB (dal log)
+    ),
+    ClusterConfig(
+        name="edge_cluster_1",
+        cpu_capacity=6000,            # 6 cores
+        memory_capacity=16739696640,  # ~16GB
+        cluster_type="edge",
+        baseline_cpu_used=3605,       # 60% utilizzato
+        baseline_memory_used=8912896000  # ~8.3GB
+    ),
+    ClusterConfig(
+        name="edge_cluster_2",
+        cpu_capacity=6000,            # 6 cores
+        memory_capacity=16739692544,  # ~16GB
+        cluster_type="edge",
+        baseline_cpu_used=3605,       # 60% utilizzato
+        baseline_memory_used=8912896000  # ~8.3GB
+    ),
+    ClusterConfig(
+        name="edge_cluster_3",
+        cpu_capacity=6000,            # 6 cores
+        memory_capacity=16739700736,  # ~16GB
+        cluster_type="edge",
+        baseline_cpu_used=3605,       # 60% utilizzato
+        baseline_memory_used=8912896000  # ~8.3GB
+    ),
+]
+
 @dataclass
 class EnvironmentConfig:
     """Configurazione Gymnasium Environment - OTTIMIZZATA v2.0"""
@@ -40,7 +78,7 @@ class EnvironmentConfig:
     # AGGIORNATO: più feature per cluster
     state_features_per_cluster: int = 9  # Era 7, ora include safety_margin, stress_level, balance_score
     state_features_global: int = 6
-    state_features_temporal: int = 4
+    state_features_temporal: int = 5
     
     # ========== REWARD SHAPING OTTIMIZZATO V2.0 ==========
     # CRITICO: Questi valori sono calibrati per success rate ≥95%
@@ -59,11 +97,14 @@ class EnvironmentConfig:
     bonus_data_locality: float = 150.0            # Era 50 → x3
     bonus_balanced_utilization: float = 200.0     # Era 80 → x2.5
     bonus_new_cluster: float = 30.0               # NUOVO: incentiva distribuzione
+    # FIXED: Parametri mancanti richiesti da environment.py
+    bonus_new_cluster_usage: float = 50.0     # FIX: Aggiunto per risolvere AttributeError
+    bonus_perfect_episode: float = 500.0      # FIX: Aggiunto per evitare errore successivo
     
     # NUOVO: Target utilization range (sweet spot)
     target_utilization_min: float = 0.40  # 40%
     target_utilization_max: float = 0.75  # 75%
-    
+    target_utilization_ideal: float = 0.60 # 60% ideale
     # Penalità per data transfer remoto
     penalty_remote_placement: float = -20.0
     
@@ -113,40 +154,7 @@ class EnvironmentConfig:
             # ===== METRICHE REALI DAL LOG PRODUZIONE (2026-01-17 15:32:52) =====
             # Tutti i cluster hanno STESSA capacità: 6000m CPU, 16GB RAM
             # Baseline usage: ~60% CPU (3600-3700m), ~55% RAM (8-9GB)
-            self.clusters = [
-                ClusterConfig(
-                    name="cloud_cluster",
-                    cpu_capacity=6000,            # 6 cores
-                    memory_capacity=16739684352,  # ~16GB (dal log)
-                    cluster_type="cloud",
-                    baseline_cpu_used=3715,       # 62% utilizzato (dal log)
-                    baseline_memory_used=9189720064  # ~8.6GB (dal log)
-                ),
-                ClusterConfig(
-                    name="edge_cluster_1",
-                    cpu_capacity=6000,            # 6 cores
-                    memory_capacity=16739696640,  # ~16GB
-                    cluster_type="edge",
-                    baseline_cpu_used=3605,       # 60% utilizzato
-                    baseline_memory_used=8912896000  # ~8.3GB
-                ),
-                ClusterConfig(
-                    name="edge_cluster_2",
-                    cpu_capacity=6000,            # 6 cores
-                    memory_capacity=16739692544,  # ~16GB
-                    cluster_type="edge",
-                    baseline_cpu_used=3605,       # 60% utilizzato
-                    baseline_memory_used=8912896000  # ~8.3GB
-                ),
-                ClusterConfig(
-                    name="edge_cluster_3",
-                    cpu_capacity=6000,            # 6 cores
-                    memory_capacity=16739700736,  # ~16GB
-                    cluster_type="edge",
-                    baseline_cpu_used=3605,       # 60% utilizzato
-                    baseline_memory_used=8912896000  # ~8.3GB
-                ),
-            ]
+            self.clusters = DEFAULT_CLUSTERS
         
         # Applica parametri specifici per difficulty
         if self.difficulty in self.difficulty_params:
@@ -181,6 +189,9 @@ class EnvironmentConfig:
             "penalty_remote_placement": self.penalty_remote_placement,
         }
 
+    def get_difficulty_params(self) -> Dict:
+        """Helper per recuperare i parametri della difficulty corrente"""
+        return self.difficulty_params.get(self.difficulty, self.difficulty_params["medium"])
 
 # ========== PIPELINE WORKLOAD TEMPLATES ==========
 # AGGIORNATO: Basati su DATI REALI dal progetto CloudContinuum

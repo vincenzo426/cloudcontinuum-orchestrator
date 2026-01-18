@@ -23,7 +23,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from .environment import CloudContinuumEnv
-from .config import EnvironmentConfig, get_config_for_training
+from .config import EnvironmentConfig, get_config_for_difficulty
 
 
 class ExpertPolicy:
@@ -145,7 +145,7 @@ def collect_expert_demonstrations(
     print(f"Difficulty: {difficulty}")
     print("="*60)
     
-    config = get_config_for_training(difficulty)
+    config = get_config_for_difficulty(difficulty)
     config.master_seed = seed
     
     env = CloudContinuumEnv(config=config, seed=seed)
@@ -232,26 +232,11 @@ def pretrain_with_behavioral_cloning(
 ) -> PPO:
     """
     Pre-addestra policy usando behavioral cloning (supervised learning).
-    
-    Args:
-        observations: Expert observations
-        actions: Expert actions
-        model: PPO model da pre-addestrare
-        num_epochs: Training epochs
-        batch_size: Batch size
-        learning_rate: Learning rate per BC
-    
-    Returns:
-        Pre-trained model
     """
     print("\n" + "="*60)
     print("BEHAVIORAL CLONING PRE-TRAINING")
     print("="*60)
     print(f"Demonstrations: {len(observations):,}")
-    print(f"Epochs: {num_epochs}")
-    print(f"Batch size: {batch_size}")
-    print(f"Learning rate: {learning_rate}")
-    print("="*60)
     
     # Create dataset and dataloader
     dataset = ExpertDataset(observations, actions)
@@ -262,7 +247,6 @@ def pretrain_with_behavioral_cloning(
     optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
     
-    # Training loop
     print("\nTraining...")
     for epoch in range(num_epochs):
         total_loss = 0.0
@@ -273,9 +257,18 @@ def pretrain_with_behavioral_cloning(
             # Forward pass
             optimizer.zero_grad()
             
-            # Get action logits from policy
+            # =================================================================
+            # FIX CRITICO: Passaggio corretto attraverso MLP extractor
+            # =================================================================
+            # 1. Extract features (Flatten)
             features = policy.extract_features(batch_obs)
-            action_logits = policy.action_net(features)
+            
+            # 2. Pass through MLP body (shared net or pi net)
+            # mlp_extractor ritorna (latent_policy, latent_value)
+            latent_pi, _ = policy.mlp_extractor(features)
+            
+            # 3. Action logits from latent representation
+            action_logits = policy.action_net(latent_pi)
             
             # Compute loss
             loss = criterion(action_logits, batch_actions)
@@ -325,7 +318,7 @@ def evaluate_pretrained_model(
     print(f"Difficulty: {difficulty}")
     print("="*60)
     
-    config = get_config_for_training(difficulty)
+    config = get_config_for_difficulty(difficulty)
     env = CloudContinuumEnv(config=config, seed=9999)
     
     episode_rewards = []
@@ -399,7 +392,7 @@ def main():
     
     # STEP 2: Initialize PPO model
     print("\n🤖 STEP 2/4: Initializing PPO model...")
-    config = get_config_for_training(args.difficulty)
+    config = get_config_for_difficulty(args.difficulty)
     
     def make_env():
         return CloudContinuumEnv(config=config, seed=42)
