@@ -272,30 +272,60 @@ def train_curriculum(
 
 def evaluate_final_model(model_path: str, difficulty: str = "hard") -> Dict:
     print("\n" + "=" * 70)
-    print(" " * 20 + "FINAL MODEL EVALUATION")
+    print(" " * 20 + "FINAL MODEL EVALUATION (CORRECTED)")
     print("=" * 70)
+    
+    # 1. Crea l'ambiente base
     env = create_training_env(difficulty=difficulty, seed=7777)
-    env = VecNormalize(env, norm_obs=True, norm_reward=False, training=False)
+    
+    # 2. CERCA E CARICA LE STATISTICHE DI NORMALIZZAZIONE
+    # Il file vec_normalize.pkl si trova solitamente nella stessa cartella del modello
+    model_dir = os.path.dirname(model_path)
+    vec_norm_path = os.path.join(model_dir, "vec_normalize.pkl")
+    
+    if os.path.exists(vec_norm_path):
+        print(f"🔄 Loading normalization stats from: {vec_norm_path}")
+        # Carica le statistiche imparate durante il training
+        env = VecNormalize.load(vec_norm_path, env)
+        # Importante: Disabilita l'aggiornamento delle statistiche (training=False)
+        # e la normalizzazione dei reward (vogliamo leggere il reward reale)
+        env.training = False
+        env.norm_reward = False
+    else:
+        print("⚠️ WARNING: vec_normalize.pkl not found! Evaluating with un-normalized environment.")
+        print("   This will likely result in poor performance (70-80% instead of 100%).")
+        # Fallback (come era prima)
+        env = VecNormalize(env, norm_obs=True, norm_reward=False, training=False)
+    
     print(f"Loading model: {model_path}")
     model = MaskablePPO.load(model_path, env=env)
     
     results = {'success_rates': [], 'episode_rewards': []}
-    print("Running evaluation (100 episodes)...")
+    
+    print("\nRunning evaluation (100 episodes)...")
     for ep in range(100):
         obs = env.reset()
         done = False
         ep_rew = 0
+        
         while not done:
+            # Masking è gestito automaticamente se l'env supporta action masking
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, info = env.step(action)
             ep_rew += reward[0]
+        
         results['success_rates'].append(info[0]['success_rate'])
         results['episode_rewards'].append(ep_rew)
-        if (ep+1)%20==0: print(f"  Progress: {ep+1}/100")
         
-    print(f"\nSuccess Rate: {np.mean(results['success_rates'])*100:.2f}%")
+        if (ep + 1) % 20 == 0:
+            print(f"  Progress: {ep+1}/100")
+    
+    mean_success = np.mean(results['success_rates'])
+    print("\n" + "=" * 70)
+    print(f"Success Rate: {mean_success*100:.2f}%")
     print(f"Mean Reward: {np.mean(results['episode_rewards']):.2f}")
-    return {}
+    
+    return results
 
 def main():
     parser = argparse.ArgumentParser()
