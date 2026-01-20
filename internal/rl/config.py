@@ -1,13 +1,10 @@
 # internal/rl/config.py
 """
 Configurazione centralizzata per RL-based pipeline placement
-VERSIONE 2.0 - OTTIMIZZATA PER SUCCESS RATE ≥95%
+VERSIONE 2.1 - REFACTOR VARIABILI DI UTILIZZO
 
-CHANGELOG v2.0:
-- Reward shaping drasticamente migliorato
-- Baseline di utilizzo realistico dai log produzione
-- Parametri per action masking
-- Target utilization ranges
+CHANGELOG v2.1:
+- Sostituite variabili baseline_* con cpu_used/memory_used per allineamento con Controller
 """
 
 from dataclasses import dataclass, field
@@ -21,45 +18,45 @@ class ClusterConfig:
     memory_capacity: int   # bytes
     cluster_type: str      # "cloud" o "edge"
     
-    # Baseline di utilizzo realistico (dai log produzione 2026-01-16)
-    baseline_cpu_used: int = 0
-    baseline_memory_used: int = 0
+    # Utilizzo corrente (ex baseline)
+    cpu_used: int = 0
+    memory_used: int = 0
 
 # =============================================================================
-# CORREZIONE: Definisci DEFAULT_CLUSTERS a livello globale per l'export
+# DEFAULT_CLUSTERS a livello globale
 # =============================================================================
 DEFAULT_CLUSTERS = [
     ClusterConfig(
         name="cloud_cluster",
         cpu_capacity=6000,            # 6 cores
-        memory_capacity=16739684352,  # ~16GB (dal log)
+        memory_capacity=16739684352,  # ~16GB
         cluster_type="cloud",
-        baseline_cpu_used=500,       # 62% utilizzato (dal log)
-        baseline_memory_used=1073741824  # ~8.6GB (dal log)
+        cpu_used=500,                 # 62% utilizzato
+        memory_used=1073741824        # ~8.6GB
     ),
     ClusterConfig(
         name="edge_cluster_1",
         cpu_capacity=6000,            # 6 cores
         memory_capacity=16739696640,  # ~16GB
         cluster_type="edge",
-        baseline_cpu_used=500,       # 60% utilizzato
-        baseline_memory_used=1073741824  # ~8.3GB
+        cpu_used=500,                 # 60% utilizzato
+        memory_used=1073741824        # ~8.3GB
     ),
     ClusterConfig(
         name="edge_cluster_2",
         cpu_capacity=6000,            # 6 cores
         memory_capacity=16739692544,  # ~16GB
         cluster_type="edge",
-        baseline_cpu_used=500,       # 60% utilizzato
-        baseline_memory_used=1073741824  # ~8.3GB
+        cpu_used=500,                 # 60% utilizzato
+        memory_used=1073741824        # ~8.3GB
     ),
     ClusterConfig(
         name="edge_cluster_3",
         cpu_capacity=6000,            # 6 cores
         memory_capacity=16739700736,  # ~16GB
         cluster_type="edge",
-        baseline_cpu_used=500,       # 60% utilizzato
-        baseline_memory_used=1073741824  # ~8.3GB
+        cpu_used=500,                 # 60% utilizzato
+        memory_used=1073741824        # ~8.3GB
     ),
 ]
 
@@ -156,9 +153,6 @@ class EnvironmentConfig:
     
     def __post_init__(self):
         if self.clusters is None:
-            # ===== METRICHE REALI DAL LOG PRODUZIONE (2026-01-17 15:32:52) =====
-            # Tutti i cluster hanno STESSA capacità: 6000m CPU, 16GB RAM
-            # Baseline usage: ~60% CPU (3600-3700m), ~55% RAM (8-9GB)
             self.clusters = DEFAULT_CLUSTERS
         
         # Applica parametri specifici per difficulty
@@ -200,35 +194,29 @@ class EnvironmentConfig:
 
 # ========== PIPELINE WORKLOAD TEMPLATES ==========
 # AGGIORNATO: Basati su DATI REALI dal progetto CloudContinuum
-# Fonte: examples/pipeline.yaml e log produzione
-# Executor tipico: 100m CPU + 512MB-4GB RAM
-# Pipeline tipiche: 2-10 executor = 200m-1000m CPU totali, 1-8GB RAM totali
-
 PIPELINE_TEMPLATES = {
     "light": {
         "cpu_range": (200, 600),
         "memory_range": (0.5, 2),
-        "probability": 0.4,            # Ridotto leggermente (era 0.5)
+        "probability": 0.4,
         "description": "2-6 executors, preprocessing/inference leggero"
     },
     "medium": {
         "cpu_range": (600, 1200),
         "memory_range": (2, 5),
-        "probability": 0.4,            # Aumentato (era 0.35) - Più carico medio
+        "probability": 0.4,
         "description": "6-12 executors, training moderato"
     },
     "heavy": {
-        "cpu_range": (1500, 2500),     # AUMENTATO MAX: Da 2000 a 2500
-        "memory_range": (5, 8),        # Aumentato leggermente RAM
-        "probability": 0.2,            # Aumentato (era 0.15) - Più heavy
+        "cpu_range": (1500, 2500),
+        "memory_range": (5, 8),
+        "probability": 0.2,
         "description": "12-20 executors, training intensivo"
     },
 }
 
-
 # ========== INSTANCE GLOBALE ==========
 DEFAULT_CONFIG = EnvironmentConfig()
-
 
 # ========== UTILITIES ==========
 def get_config_for_difficulty(difficulty: str) -> EnvironmentConfig:
@@ -236,7 +224,6 @@ def get_config_for_difficulty(difficulty: str) -> EnvironmentConfig:
     config = EnvironmentConfig()
     config.difficulty = difficulty
     return config
-
 
 def print_config_summary(config: EnvironmentConfig):
     """Stampa riepilogo configurazione (utile per debugging)"""
@@ -253,15 +240,7 @@ def print_config_summary(config: EnvironmentConfig):
         print(f"  {key:30s}: {value:8.1f}")
     print("=" * 60)
 
-
 if __name__ == "__main__":
     # Test configuration
     config = DEFAULT_CONFIG
     print_config_summary(config)
-    
-    # Test difficulty variations
-    for difficulty in ["easy", "medium", "hard"]:
-        print(f"\n{difficulty.upper()} difficulty:")
-        cfg = get_config_for_difficulty(difficulty)
-        print(f"  Pipelines per episode: {cfg.pipelines_per_episode}")
-        print(f"  Resource variance: {cfg.difficulty_params[difficulty]['resource_variance']}")

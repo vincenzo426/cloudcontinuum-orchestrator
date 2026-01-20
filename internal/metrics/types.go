@@ -44,9 +44,9 @@ type Config struct {
 // DefaultConfig ritorna una configurazione di default
 func DefaultConfig() *Config {
 	return &Config{
-		RefreshInterval: 30 * time.Second,
+		RefreshInterval: 10 * time.Second,
 		LatencyTimeout:  5 * time.Second,
 		MetricsTimeout:  10 * time.Second,
-		CacheTTL:        60 * time.Second,
+		CacheTTL:        20 * time.Second,
 	}
 }

@@ -95,8 +95,8 @@ class RLPlacementAgent:
                 - cpu_available: int
                 - memory_capacity: int
                 - memory_available: int
-                - baseline_cpu: int
-                - baseline_memory: int
+                - cpu_used: int       <--- NUOVO (ex baseline)
+                - memory_used: int    <--- NUOVO (ex baseline)
         
         Returns:
             Dict con:
@@ -178,12 +178,13 @@ class RLPlacementAgent:
             cpu_avail_norm = cluster['cpu_available'] / cluster['cpu_capacity']
             mem_avail_norm = cluster['memory_available'] / cluster['memory_capacity']
             
-            # Safety margin (quanto sopra baseline)
-            cpu_above_baseline = max(0, cluster['cpu_available'] - cluster['baseline_cpu'])
-            mem_above_baseline = max(0, cluster['memory_available'] - cluster['baseline_memory'])
+            # Safety margin (calcolato usando cpu_used/memory_used come richiesto)
+            # Qui assumiamo che cpu_used sia l'uso attuale passato dal controller
+            cpu_above_usage = max(0, cluster['cpu_available'] - cluster['cpu_used'])
+            mem_above_usage = max(0, cluster['memory_available'] - cluster['memory_used'])
             
-            cpu_margin = cpu_above_baseline / cluster['cpu_capacity']
-            mem_margin = mem_above_baseline / cluster['memory_capacity']
+            cpu_margin = cpu_above_usage / cluster['cpu_capacity']
+            mem_margin = mem_above_usage / cluster['memory_capacity']
             safety_margin = (cpu_margin + mem_margin) / 2.0
             
             # Stress level (quanto vicino a saturazione)
@@ -320,24 +321,11 @@ def predict():
                 "cpu_available": 12000,
                 "memory_capacity": 34359738368,
                 "memory_available": 25769803776,
-                "baseline_cpu": 4000,
-                "baseline_memory": 8589934592
+                "cpu_used": 4000,            <--- MODIFICATO
+                "memory_used": 8589934592    <--- MODIFICATO
             },
             "edge_cluster_1": { ... },
             ...
-        }
-    }
-    
-    Response JSON:
-    {
-        "target_cluster": "edge_cluster_1",
-        "confidence": 0.87,
-        "reason": "RL-based: data locality satisfied, optimal utilization, high confidence (87.3%)",
-        "action_probabilities": {
-            "cloud_cluster": 0.05,
-            "edge_cluster_1": 0.87,
-            "edge_cluster_2": 0.06,
-            "edge_cluster_3": 0.02
         }
     }
     """

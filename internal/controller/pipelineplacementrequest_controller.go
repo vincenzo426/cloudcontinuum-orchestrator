@@ -339,7 +339,7 @@ func (r *PipelinePlacementRequestReconciler) failWithStatus(ctx context.Context,
 	}
 
 	r.updateStatusAndComplete(ctx, ppr, "", decision, nil, nil, "", "", false, fullMessage)
-	return ctrl.Result{RequeueAfter: requeueAfter}, err
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // updateStatusAndComplete aggiorna lo status e completa la riconciliazione.
