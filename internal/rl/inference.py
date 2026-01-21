@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify
 import logging
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from .environment import CloudContinuumEnv
 from .config import EnvironmentConfig, ClusterConfig, DEFAULT_CLUSTERS
@@ -36,15 +36,21 @@ class RLPlacementAgent:
     """
     RL Agent per placement inference in produzione.
     
-    Carica modello addestrato e fornisce predizioni.
+    Carica modello addestrato e fornisce predizioni con VecNormalize support.
     """
     
-    def __init__(self, model_path: str, config: Optional[EnvironmentConfig] = None):
+    def __init__(
+        self, 
+        model_path: str, 
+        vec_normalize_path: Optional[str] = None,
+        config: Optional[EnvironmentConfig] = None
+    ):
         """
         Inizializza agent.
         
         Args:
             model_path: Path al modello .zip addestrato
+            vec_normalize_path: Path al file vec_normalize.pkl (IMPORTANTE!)
             config: Environment config (se None, usa default)
         """
         logger.info(f"Loading RL model from: {model_path}")
@@ -57,20 +63,33 @@ class RLPlacementAgent:
             config = EnvironmentConfig(
                 clusters=DEFAULT_CLUSTERS,
                 pipelines_per_episode=1,  # Inference: 1 pipeline alla volta
-                max_steps_per_episode=1,
+                max_episode_steps=1,
                 master_seed=0
             )
         self.config = config
         
-        # Load model
-        self.model = PPO.load(model_path)
-        logger.info("✅ Model loaded successfully")
-        
-        # Create dummy environment per normalizzazione
+        # Create dummy environment
         def make_env():
             return CloudContinuumEnv(config=self.config, seed=0)
         
         self.env = DummyVecEnv([make_env])
+        
+        # CRITICAL: Load VecNormalize wrapper se presente
+        if vec_normalize_path and os.path.exists(vec_normalize_path):
+            logger.info(f"Loading VecNormalize from: {vec_normalize_path}")
+            self.env = VecNormalize.load(vec_normalize_path, self.env)
+            # Disabilita aggiornamento statistiche durante inference
+            self.env.training = False
+            self.env.norm_reward = False
+            logger.info("✅ VecNormalize loaded successfully")
+        else:
+            if vec_normalize_path:
+                logger.warning(f"⚠️  VecNormalize file not found at: {vec_normalize_path}")
+            logger.warning("⚠️  Running WITHOUT VecNormalize - predictions may be incorrect!")
+        
+        # Load model
+        self.model = PPO.load(model_path, env=self.env)
+        logger.info("✅ Model loaded successfully")
         
         logger.info(f"Agent initialized with {len(config.clusters)} clusters")
     
@@ -106,8 +125,11 @@ class RLPlacementAgent:
                 - action_probabilities: Dict[cluster_name, float]
         """
         try:
-            # Costruisci observation
+            # Costruisci observation (NON normalizzata)
             obs = self._build_observation(pipeline_request, clusters_state)
+            
+            # IMPORTANTE: Se VecNormalize è caricato, normalizza automaticamente
+            # l'osservazione quando passiamo attraverso self.env
             
             # Predict con modello RL
             action, _states = self.model.predict(obs, deterministic=deterministic)
@@ -163,6 +185,7 @@ class RLPlacementAgent:
         Costruisce observation vector per RL model.
         
         Deve matchare esattamente il formato di environment.py
+        NOTA: Ritorna osservazione NON normalizzata - VecNormalize la normalizzerà se caricato
         """
         obs_parts = []
         
@@ -298,7 +321,8 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'model_loaded': agent is not None
+        'model_loaded': agent is not None,
+        'vec_normalize_loaded': hasattr(agent.env, 'obs_rms') if agent else False
     })
 
 
@@ -358,6 +382,8 @@ def main():
     parser = argparse.ArgumentParser(description="CloudContinuum RL Inference Service")
     parser.add_argument("--model-path", type=str, required=True,
                         help="Path to trained model .zip")
+    parser.add_argument("--vec-normalize-path", type=str, default=None,
+                        help="Path to vec_normalize.pkl (IMPORTANT!)")
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Host to bind to")
     parser.add_argument("--port", type=int, default=5000,
@@ -371,7 +397,10 @@ def main():
     logger.info("CloudContinuum RL Inference Service")
     logger.info("="*60)
     
-    agent = RLPlacementAgent(model_path=args.model_path)
+    agent = RLPlacementAgent(
+        model_path=args.model_path,
+        vec_normalize_path=args.vec_normalize_path
+    )
     
     logger.info(f"Starting Flask server on {args.host}:{args.port}")
     logger.info("="*60)

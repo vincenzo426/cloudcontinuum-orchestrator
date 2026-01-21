@@ -1,0 +1,12 @@
+# deployments/rl-pv.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rl-model-pvc
+  namespace: kubeflow
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

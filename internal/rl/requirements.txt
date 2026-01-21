@@ -1,0 +1,29 @@
+# Core RL
+gymnasium==0.29.1
+stable-baselines3==2.3.2
+sb3-contrib==2.2.1
+torch>=2.2.0  # Lascia che pip scelga la versione compatibile
+
+# Data & Numerics
+numpy>=1.26.0,<2.0.0
+pandas>=2.1.0
+
+# Monitoring & Logging
+tensorboard>=2.15.0
+wandb>=0.16.0  # Opzionale, commentalo se non usi W&B
+
+# API (per inference futura)
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+
+# Utils
+pyyaml>=6.0.0
+tqdm>=4.66.0
+
+# Development & Testing
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0
+
+flask==3.0.0

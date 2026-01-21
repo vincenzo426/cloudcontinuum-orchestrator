@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-service
+  namespace: kubeflow
+  labels:
+    app: rl-inference
+spec:
+  type: ClusterIP
+  selector:
+    app: rl-inference
+  ports:
+  - port: 5000
+    targetPort: 5000
+    protocol: TCP
+    name: http
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-inference
+  namespace: kubeflow
+  labels:
+    app: rl-inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rl-inference
+  template:
+    metadata:
+      labels:
+        app: rl-inference
+    spec:
+      containers:
+      - name: rl-service
+        image: cenzo104/rl-inference:v2.0.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5000
+          name: http
+        args:
+          - "--model-path"
+          - "/models/final_model.zip"
+          - "--vec-normalize-path"
+          - "/models/vec_normalize.pkl"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "5000"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: rl-model-pvc

@@ -508,6 +508,7 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 		"cloud-only-pipeline":       pipeline.NewCloudOnlyPipelineStrategy(),
 		"data-locality-pipeline":    pipeline.NewDataLocalityPipelineStrategy(),
 		"simple-heuristic-pipeline": pipeline.NewSimplePipelineHeuristicStrategy(),
+		"rl-based-pipeline":         pipeline.NewRLPipelineStrategy("http://rl-service:5000"),
 	}
 
 	ctx := context.Background()
