@@ -32,10 +32,12 @@ spec:
     metadata:
       labels:
         app: rl-inference
+      annotations:
+        sidecar.istio.io/inject: "false"
     spec:
       containers:
       - name: rl-service
-        image: cenzo104/rl-inference:v2.0.0
+        image: cenzo104/rl-inference:v2.0.2
         imagePullPolicy: Always
         ports:
         - containerPort: 5000
