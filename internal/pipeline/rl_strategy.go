@@ -84,19 +84,19 @@ func (s *RLPipelineStrategy) SelectCluster(
 // RLRequest rappresenta la richiesta JSON inviata al servizio RL.
 // Deve matchare esattamente il formato atteso da inference.py
 type RLRequest struct {
-	Pipeline map[string]interface{}   `json:"pipeline"`
+	Pipeline map[string]interface{}  `json:"pipeline"`
 	Clusters map[string]ClusterState `json:"clusters"`
 }
 
 // ClusterState rappresenta lo stato di un singolo cluster.
 // Deve matchare esattamente il formato atteso da inference.py
 type ClusterState struct {
-	CPUCapacity     int64 `json:"cpu_capacity"`      // millicores
-	CPUAvailable    int64 `json:"cpu_available"`     // millicores
-	MemoryCapacity  int64 `json:"memory_capacity"`   // bytes
-	MemoryAvailable int64 `json:"memory_available"`  // bytes
-	CPUUsed         int64 `json:"cpu_used"`          // millicores
-	MemoryUsed      int64 `json:"memory_used"`       // bytes
+	CPUCapacity     int64 `json:"cpu_capacity"`     // millicores
+	CPUAvailable    int64 `json:"cpu_available"`    // millicores
+	MemoryCapacity  int64 `json:"memory_capacity"`  // bytes
+	MemoryAvailable int64 `json:"memory_available"` // bytes
+	CPUUsed         int64 `json:"cpu_used"`         // millicores
+	MemoryUsed      int64 `json:"memory_used"`      // bytes
 }
 
 // RLResponse rappresenta la risposta JSON del servizio RL.

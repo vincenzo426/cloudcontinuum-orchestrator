@@ -1,10 +1,13 @@
 # internal/rl/config.py
 """
 Configurazione centralizzata per RL-based pipeline placement
-VERSIONE 2.1 - REFACTOR VARIABILI DI UTILIZZO
+VERSIONE 2.2 - FIX CLOUD BIAS & BALANCED REWARDS
 
-CHANGELOG v2.1:
-- Sostituite variabili baseline_* con cpu_used/memory_used per allineamento con Controller
+CHANGELOG v2.2:
+- Fix reward imbalance: penalty_remote_placement aumentato -20 → -180
+- Aggiunti penalty_edge_imbalance e bonus_cloud_usage
+- Target utilization range ristretto per forzare bilanciamento
+- Baseline cluster bilanciato (cloud meno carico iniziale)
 """
 
 from dataclasses import dataclass, field
@@ -23,46 +26,46 @@ class ClusterConfig:
     memory_used: int = 0
 
 # =============================================================================
-# DEFAULT_CLUSTERS a livello globale
+# DEFAULT_CLUSTERS - BILANCIATO v2.2
 # =============================================================================
 DEFAULT_CLUSTERS = [
     ClusterConfig(
         name="cloud_cluster",
-        cpu_capacity=6000,            # 6 cores
+        cpu_capacity=8000,            # 8 cores
         memory_capacity=16739684352,  # ~16GB
         cluster_type="cloud",
-        cpu_used=500,                 # 62% utilizzato
-        memory_used=1073741824        # ~8.6GB
+        cpu_used=400,                 # ⚠️ RIDOTTO da 700 → 5% utilizzato (più attraente)
+        memory_used=805306368         # ~750MB
     ),
     ClusterConfig(
         name="edge_cluster_1",
         cpu_capacity=6000,            # 6 cores
         memory_capacity=16739696640,  # ~16GB
         cluster_type="edge",
-        cpu_used=500,                 # 60% utilizzato
-        memory_used=1073741824        # ~8.3GB
+        cpu_used=450,                 # 7.5% utilizzato
+        memory_used=1073741824        # ~1GB
     ),
     ClusterConfig(
         name="edge_cluster_2",
         cpu_capacity=6000,            # 6 cores
         memory_capacity=16739692544,  # ~16GB
         cluster_type="edge",
-        cpu_used=500,                 # 60% utilizzato
-        memory_used=1073741824        # ~8.3GB
+        cpu_used=450,                 # 7.5% utilizzato
+        memory_used=1073741824        # ~1GB
     ),
     ClusterConfig(
         name="edge_cluster_3",
         cpu_capacity=6000,            # 6 cores
         memory_capacity=16739700736,  # ~16GB
         cluster_type="edge",
-        cpu_used=500,                 # 60% utilizzato
-        memory_used=1073741824        # ~8.3GB
+        cpu_used=450,                 # 7.5% utilizzato
+        memory_used=1073741824        # ~1GB
     ),
 ]
 
 @dataclass
 class EnvironmentConfig:
-    """Configurazione Gymnasium Environment - OTTIMIZZATA v2.0"""
+    """Configurazione Gymnasium Environment - BALANCED v2.2"""
     
     # ========== CLUSTERS CONFIGURATION ==========
     clusters: List[ClusterConfig] = None
@@ -73,41 +76,43 @@ class EnvironmentConfig:
     
     # ========== STATE SPACE DIMENSIONS ==========
     state_features_per_cluster: int = 9
-    state_features_global: int = 6
+    state_features_global: int = 9  # ⚠️ AUMENTATO da 6 → 9 (+3 features balance)
     state_features_temporal: int = 5
     
-    # ========== REWARD SHAPING OTTIMIZZATO V3.0 (Tetris Mode) ==========
+    # ========== REWARD SHAPING V4.0 - BALANCED & CLOUD-FRIENDLY ==========
     reward_scale: float = 1.0
     
     # Penalità
     penalty_failed_placement: float = -500.0
     penalty_invalid_action: float = -300.0
+    penalty_overload: float = -50.0
+    penalty_underutilization: float = -20.0
     
-    # ### FIX: Ridotta penalità overload perché in 'Hard' vogliamo riempire i cluster
-    penalty_overload: float = -50.0       # Era -200. Puniamo solo se stiamo scoppiando (>95%)
-    penalty_underutilization: float = -20.0 # Era -50. Meno grave se siamo all'inizio
-    penalty_cluster_monopoly: float = -100.0
-    penalty_remote_placement: float = -20.0
+    # ⚠️ FIX CRITICO #1: Monopoly più severa
+    penalty_cluster_monopoly: float = -200.0  # Era -100
+    
+    # ⚠️ FIX CRITICO #2: Remote placement MOLTO più costoso
+    penalty_remote_placement: float = -180.0  # Era -20 → Ora -180
+    
+    # ⚠️ FIX CRITICO #3: Penalità per squilibrio edge clusters
+    penalty_edge_imbalance: float = -120.0  # NUOVO
     
     # Reward e Bonus
     bonus_successful_placement: float = 100.0
-    
-    # ### FIX: Aumentata Data Locality per renderla prioritaria
-    bonus_data_locality: float = 200.0            # Era 150. Locality è cruciale.
-    bonus_balanced_utilization: float = 150.0     # Era 200. Bilanciamento secondario alla locality.
-    
+    bonus_data_locality: float = 200.0
+    bonus_balanced_utilization: float = 150.0
     bonus_new_cluster: float = 30.0
     bonus_new_cluster_usage: float = 50.0
+    
+    # ⚠️ FIX CRITICO #4: Bonus per uso cloud (compensa costi percepiti)
+    bonus_cloud_usage: float = 80.0  # NUOVO
+    
     bonus_perfect_episode: float = 500.0
     
-    # ### FIX: Allargato il range ideale per supportare carico elevato (Hard scenario)
-
-    target_utilization_min: float = 0.30  # 30% - Accetta carico iniziale basso
-    target_utilization_max: float = 0.95  # 95% - Accetta cluster quasi pieni (Tetris!)
-    target_utilization_ideal: float = 0.70 # Target spostato leggermente in alto
-    
-    # Penalità per data transfer remoto
-    penalty_remote_placement: float = -20.0
+    # ⚠️ FIX CRITICO #5: Range utilization ristretto per forzare bilanciamento
+    target_utilization_min: float = 0.45  # Era 0.30 → Più stretto
+    target_utilization_max: float = 0.85  # Era 0.95 → Più stretto
+    target_utilization_ideal: float = 0.70
     
     # ========== SIMULATION PARAMETERS ==========
     simulation_speedup: float = 1000.0
@@ -124,18 +129,18 @@ class EnvironmentConfig:
     # Parametri variabili per difficulty
     difficulty_params: Dict[str, Dict] = field(default_factory=lambda: {
         "easy": {
-            "pipelines_per_episode": 6,   # Aumentato da 4
+            "pipelines_per_episode": 6,
             "resource_variance": 0.1,
             "failure_tolerance": 0.3,
         },
         "medium": {
-            "pipelines_per_episode": 10,  # Aumentato da 7
+            "pipelines_per_episode": 10,
             "resource_variance": 0.25,
             "failure_tolerance": 0.15,
         },
         "hard": {
             "pipelines_per_episode": 16,  
-            "resource_variance": 0.45,    # Aumentata varianza
+            "resource_variance": 0.45,
             "failure_tolerance": 0.05,
             "data_locality_probability": 0.2
         }
@@ -145,7 +150,7 @@ class EnvironmentConfig:
     master_seed: int = 42
     
     # ========== ACTION MASKING ==========
-    enable_action_masking: bool = True  # CRITICO per success rate
+    enable_action_masking: bool = True
     
     # ========== LOGGING & MONITORING ==========
     verbose: bool = True
@@ -181,11 +186,13 @@ class EnvironmentConfig:
             "penalty_overload": self.penalty_overload,
             "penalty_underutilization": self.penalty_underutilization,
             "penalty_cluster_monopoly": self.penalty_cluster_monopoly,
+            "penalty_remote_placement": self.penalty_remote_placement,
+            "penalty_edge_imbalance": self.penalty_edge_imbalance,
             "bonus_successful_placement": self.bonus_successful_placement,
             "bonus_data_locality": self.bonus_data_locality,
             "bonus_balanced_utilization": self.bonus_balanced_utilization,
             "bonus_new_cluster": self.bonus_new_cluster,
-            "penalty_remote_placement": self.penalty_remote_placement,
+            "bonus_cloud_usage": self.bonus_cloud_usage,
         }
 
     def get_difficulty_params(self) -> Dict:
@@ -193,7 +200,6 @@ class EnvironmentConfig:
         return self.difficulty_params.get(self.difficulty, self.difficulty_params["medium"])
 
 # ========== PIPELINE WORKLOAD TEMPLATES ==========
-# AGGIORNATO: Basati su DATI REALI dal progetto CloudContinuum
 PIPELINE_TEMPLATES = {
     "light": {
         "cpu_range": (200, 600),

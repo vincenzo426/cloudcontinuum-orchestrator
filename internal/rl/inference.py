@@ -154,50 +154,162 @@ class RLPlacementAgent:
         return mask
 
     def _build_observation(self, pipeline_request: Dict, clusters_state: Dict) -> np.ndarray:
-        """Costruisce il vettore di osservazione (deve matchare l'ambiente di training)"""
+        """
+        Costruisce il vettore di osservazione (50 features - ALIGNED con environment v2.1)
+        
+        Structure:
+        - Per-cluster: 9 × 4 = 36 features
+        - Global: 9 features (6 originali + 3 nuove)
+        - Temporal: 5 features
+        Total: 50 features
+        """
         obs_parts = []
         
+        # === PER-CLUSTER FEATURES (9 × 4 = 36) ===
         for cluster_cfg in self.config.clusters:
             cluster = clusters_state[cluster_cfg.name]
             
-            cpu_util = 1.0 - (cluster['cpu_available'] / cluster['cpu_capacity'])
-            mem_util = 1.0 - (cluster['memory_available'] / cluster['memory_capacity'])
-            cpu_avail_norm = cluster['cpu_available'] / cluster['cpu_capacity']
-            mem_avail_norm = cluster['memory_available'] / cluster['memory_capacity']
+            # Utilization
+            cpu_util = 1.0 - (cluster['cpu_available'] / max(cluster['cpu_capacity'], 1))
+            mem_util = 1.0 - (cluster['memory_available'] / max(cluster['memory_capacity'], 1))
             
-            cpu_above_usage = max(0, cluster['cpu_available'] - cluster.get('cpu_used', 0))
-            mem_above_usage = max(0, cluster['memory_available'] - cluster.get('memory_used', 0))
+            # Available (normalized)
+            cpu_avail_norm = cluster['cpu_available'] / max(cluster['cpu_capacity'], 1)
+            mem_avail_norm = cluster['memory_available'] / max(cluster['memory_capacity'], 1)
             
-            cpu_margin = cpu_above_usage / cluster['cpu_capacity']
-            mem_margin = mem_above_usage / cluster['memory_capacity']
-            safety_margin = (cpu_margin + mem_margin) / 2.0
-            stress_level = max(cpu_util, mem_util)
+            # Safety margin
+            safety_margin = min(cpu_avail_norm, mem_avail_norm)
+            
+            # Stress level
+            stress_level = (cpu_util + mem_util) / 2.0
+            
+            # Balance score
             balance_score = 1.0 - abs(cpu_util - mem_util)
-            headroom = min(cpu_avail_norm, mem_avail_norm)
+            
+            # Headroom
+            headroom = (cpu_avail_norm + mem_avail_norm) / 2.0
+            
+            # Is data cluster
             is_data_cluster = 1.0 if cluster_cfg.name == pipeline_request['data_location'] else 0.0
             
             obs_parts.extend([
-                cpu_util, mem_util, cpu_avail_norm, mem_avail_norm,
-                safety_margin, stress_level, balance_score, headroom, is_data_cluster
+                cpu_util, mem_util,
+                cpu_avail_norm, mem_avail_norm,
+                safety_margin, stress_level, balance_score,
+                headroom, is_data_cluster
             ])
         
-        max_cpu = max(c.cpu_capacity for c in self.config.clusters)
-        max_mem = max(c.memory_capacity for c in self.config.clusters)
+        # === GLOBAL FEATURES (9 total) ===
+        # Normalize pipeline requirements
+        avg_cpu_capacity = np.mean([c['cpu_capacity'] for c in clusters_state.values()])
+        avg_mem_capacity = np.mean([c['memory_capacity'] for c in clusters_state.values()])
         
-        pipeline_cpu_norm = pipeline_request['cpu_required'] / max_cpu
-        pipeline_mem_norm = pipeline_request['memory_required'] / max_mem
+        pipeline_cpu_norm = pipeline_request['cpu_required'] / max(avg_cpu_capacity, 1)
+        pipeline_mem_norm = pipeline_request['memory_required'] / max(avg_mem_capacity, 1)
         
+        # Placement difficulty
+        placement_difficulty = max(pipeline_cpu_norm, pipeline_mem_norm)
+        
+        # Episode progress (dummy in inference)
+        episode_progress = 0.0
+        
+        # Success rate (dummy in inference)
+        success_rate = 1.0
+        
+        # Data locality flag
+        is_data_local = 1.0 if pipeline_request['data_location'] != "none" else 0.0
+        
+        # Features 1-6 (originali)
         obs_parts.extend([
-            pipeline_cpu_norm, pipeline_mem_norm, 
-            (pipeline_cpu_norm + pipeline_mem_norm) / 2.0, 
-            0.0, 1.0, 
-            1.0 if pipeline_request['data_location'] != "none" else 0.0
+            pipeline_cpu_norm,
+            pipeline_mem_norm,
+            placement_difficulty,
+            episode_progress,
+            success_rate,
+            is_data_local
         ])
         
-        # Temporal features (5 dummy zeros come nel training)
-        obs_parts.extend([0.0] * 5)
+        # ⚠️ NUOVE FEATURES 7-9 (MANCANTI NELLA VERSIONE ATTUALE)
         
-        return np.array(obs_parts, dtype=np.float32).reshape(1, -1)
+        # 7. Cloud vs Edge utilization ratio
+        cloud_clusters = [c for cname, c in clusters_state.items() 
+                        if any(cfg.name == cname and cfg.cluster_type == 'cloud' 
+                                for cfg in self.config.clusters)]
+        edge_clusters = [c for cname, c in clusters_state.items() 
+                        if any(cfg.name == cname and cfg.cluster_type == 'edge' 
+                            for cfg in self.config.clusters)]
+        
+        if cloud_clusters and edge_clusters:
+            cloud_avg_util = np.mean([
+                (c['cpu_capacity'] - c['cpu_available']) / max(c['cpu_capacity'], 1) +
+                (c['memory_capacity'] - c['memory_available']) / max(c['memory_capacity'], 1)
+                for c in cloud_clusters
+            ]) / 2.0
+            
+            edge_avg_util = np.mean([
+                (c['cpu_capacity'] - c['cpu_available']) / max(c['cpu_capacity'], 1) +
+                (c['memory_capacity'] - c['memory_available']) / max(c['memory_capacity'], 1)
+                for c in edge_clusters
+            ]) / 2.0
+            
+            cloud_edge_ratio = cloud_avg_util / (edge_avg_util + 1e-6)
+        else:
+            cloud_edge_ratio = 1.0
+        
+        obs_parts.append(cloud_edge_ratio)
+        
+        # 8. Edge clusters imbalance (variance)
+        if len(edge_clusters) > 1:
+            edge_utils = [
+                ((c['cpu_capacity'] - c['cpu_available']) / max(c['cpu_capacity'], 1) +
+                (c['memory_capacity'] - c['memory_available']) / max(c['memory_capacity'], 1)) / 2.0
+                for c in edge_clusters
+            ]
+            edge_imbalance = np.std(edge_utils)
+        else:
+            edge_imbalance = 0.0
+        
+        obs_parts.append(edge_imbalance)
+        
+        # 9. Data transfer cost estimate
+        if pipeline_request['data_location'] != 'none':
+            data_loc = pipeline_request['data_location']
+            
+            # Trova il tipo del cluster con i dati
+            data_cluster_type = None
+            for cfg in self.config.clusters:
+                if cfg.name == data_loc:
+                    data_cluster_type = cfg.cluster_type
+                    break
+            
+            # Calcola costo medio trasferimento
+            transfer_costs = []
+            for cfg in self.config.clusters:
+                if cfg.name == data_loc:
+                    cost = 0.0  # Local
+                elif (data_cluster_type == 'cloud' and cfg.cluster_type == 'edge') or \
+                    (data_cluster_type == 'edge' and cfg.cluster_type == 'cloud'):
+                    cost = 1.0  # Cloud<->Edge (alto)
+                else:
+                    cost = 0.5  # Edge<->Edge (medio)
+                transfer_costs.append(cost)
+            
+            avg_transfer_cost = np.mean(transfer_costs)
+        else:
+            avg_transfer_cost = 0.0
+        
+        obs_parts.append(avg_transfer_cost)
+        
+        # === TEMPORAL FEATURES (5) ===
+        obs_parts.extend([0.0] * 5)  # Dummy temporal features
+        
+        # Reshape to (1, 50)
+        obs = np.array(obs_parts, dtype=np.float32).reshape(1, -1)
+        
+        # Validate shape
+        assert obs.shape == (1, 50), f"Wrong observation shape: {obs.shape}, expected (1, 50)"
+    
+        return obs
 
     def _generate_reason(self, pipeline_request: Dict, clusters_state: Dict, target: str, conf: float) -> str:
         reasons = []

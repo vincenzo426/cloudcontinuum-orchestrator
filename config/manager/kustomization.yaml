@@ -4,5 +4,5 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
-  newName: cenzo104/cloudcontinuum-orchestrator
-  newTag: v5.0.8
+  newName: controller
+  newTag: latest

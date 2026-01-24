@@ -1,13 +1,13 @@
 # internal/rl/environment.py
 """
 CloudContinuum Gymnasium Environment
-VERSIONE 2.0 - Con Action Masking e Reward Shaping Avanzato
+VERSIONE 2.1 - BALANCED REWARDS & ENHANCED STATE
 
-Features v2.0:
-- Action masking nativo per MaskablePPO
-- State representation potenziata (9 feature/cluster)
-- Reward shaping aggressivo per >95% success rate
-- Tracking dettagliato fallimenti
+CHANGELOG v2.1:
+- Reward calculation ribilanciato per evitare cloud bias
+- Aggiunta penalty per edge clusters imbalance
+- Aggiunto bonus cloud usage
+- Enhanced state features (+3 global: cloud/edge ratio, edge imbalance, transfer cost)
 """
 
 import gymnasium as gym
@@ -26,15 +26,16 @@ class CloudContinuumEnv(gym.Env):
     
     State Space: Vector di float con info su:
         - Per-cluster features (9 per cluster)
-        - Global features (6 totali)
+        - Global features (9 totali) ← AUMENTATO da 6
         - Temporal features (5 totali)
     
     Action Space: Discrete(num_clusters) - selezione del cluster
     
-    Reward:
-        - Successo: +100 base + bonus data locality/balance
+    Reward v2.1:
+        - Successo: +100 base + bonus data locality/balance/cloud
         - Fallimento: -500 (aggressivo)
         - Invalid action: -300
+        - Remote placement: -180 (aumentato da -20)
     """
     
     metadata = {"render_modes": ["human"]}
@@ -123,10 +124,10 @@ class CloudContinuumEnv(gym.Env):
                 'name': cluster_config.name,
                 'cpu_capacity': cluster_config.cpu_capacity,
                 'memory_capacity': cluster_config.memory_capacity,
-                'cpu_used': cluster_config.baseline_cpu_used,
-                'memory_used': cluster_config.baseline_memory_used,
-                'cpu_available': cluster_config.cpu_capacity - cluster_config.baseline_cpu_used,
-                'memory_available': cluster_config.memory_capacity - cluster_config.baseline_memory_used,
+                'cpu_used': cluster_config.cpu_used,
+                'memory_used': cluster_config.memory_used,
+                'cpu_available': cluster_config.cpu_capacity - cluster_config.cpu_used,
+                'memory_available': cluster_config.memory_capacity - cluster_config.memory_used,
                 'placements_count': 0,  # Count placement in questo episodio
                 'cluster_type': cluster_config.cluster_type
             }
@@ -339,27 +340,29 @@ class CloudContinuumEnv(gym.Env):
         """
         Calcola reward per placement riuscito.
         
-        COMPONENTI REWARD:
+        COMPONENTI REWARD V2.1 - BALANCED:
         1. Base success bonus
-        2. Data locality bonus
+        2. Data locality bonus/penalty (CRITICO - aumentato peso)
         3. Balanced utilization bonus
-        4. Cluster diversity bonus
-        5. Penalty per overload/underutilization
+        4. Cluster diversity + monopoly prevention (migliorato)
+        5. Edge clusters balance (NUOVO)
+        6. Cloud usage incentive (NUOVO)
+        7. Penalty per overload/underutilization
         """
         reward = self.config.bonus_successful_placement  # Base: +100
         
-        # 1. DATA LOCALITY BONUS
+        # === 1. DATA LOCALITY (PRIORITÀ MASSIMA) ===
         if is_data_local:
-            reward += self.config.bonus_data_locality  # +150
+            reward += self.config.bonus_data_locality  # +200
         else:
-            reward += self.config.penalty_remote_placement  # -30
+            # ⚠️ FIX CRITICO: Penalty remote MOLTO più alta
+            reward += self.config.penalty_remote_placement  # -180 (era -20)
         
-        # 2. BALANCED UTILIZATION BONUS
-        cpu_util = cluster['cpu_used'] / cluster['cpu_capacity']
-        mem_util = cluster['memory_used'] / cluster['memory_capacity']
+        # === 2. BALANCED UTILIZATION ===
+        cpu_util = cluster['cpu_used'] / max(cluster['cpu_capacity'], 1)
+        mem_util = cluster['memory_used'] / max(cluster['memory_capacity'], 1)
         avg_util = (cpu_util + mem_util) / 2.0
         
-        # Sweet spot: 40-75% utilization
         if self.config.target_utilization_min <= avg_util <= self.config.target_utilization_max:
             # Dentro range ottimale
             distance_from_ideal = abs(avg_util - self.config.target_utilization_ideal)
@@ -372,14 +375,41 @@ class CloudContinuumEnv(gym.Env):
             # Pericoloso - quasi saturo
             reward += self.config.penalty_overload
         
-        # 3. CLUSTER DIVERSITY BONUS
-        # Incentiva distribuzione su più cluster
+        # === 3. CLUSTER DIVERSITY & MONOPOLY PREVENTION (migliorato) ===
         if cluster['placements_count'] == 1:
             # Primo placement su questo cluster = buono
             reward += self.config.bonus_new_cluster_usage  # +50
-        elif cluster['placements_count'] > len(self.pipelines_queue) * 0.6:
+        elif cluster['placements_count'] > len(self.pipelines_queue) * 0.5:  # ⚠️ Ridotto da 0.6 a 0.5
             # Troppi placement su singolo cluster = male
-            reward += self.config.penalty_cluster_monopoly  # -150
+            reward += self.config.penalty_cluster_monopoly  # -200 (aumentato da -100)
+        
+        # === 4. ⚠️ NUOVO: EDGE CLUSTERS BALANCE ===
+        # Penalizza se gli edge cluster hanno utilizzo sbilanciato
+        edge_clusters = [c for c in self.clusters_state.values() 
+                         if c['cluster_type'] == 'edge']
+        
+        if len(edge_clusters) > 1 and cluster['cluster_type'] == 'edge':
+            edge_utils = [(c['cpu_used'] / max(c['cpu_capacity'], 1) + 
+                           c['memory_used'] / max(c['memory_capacity'], 1)) / 2.0 
+                          for c in edge_clusters]
+            
+            # Calcola variance dell'utilizzo tra edge
+            edge_variance = np.var(edge_utils)
+            
+            # Penalità se variance è alta (squilibrio)
+            if edge_variance > 0.05:  # Soglia: 5% di variance
+                imbalance_penalty = self.config.penalty_edge_imbalance * edge_variance
+                reward += imbalance_penalty  # Negativo (es. -120 * 0.1 = -12)
+        
+        # === 5. ⚠️ NUOVO: CLOUD USAGE INCENTIVE ===
+        # Bonus se usi il cloud quando è appropriato
+        if cluster['cluster_type'] == 'cloud':
+            # Bonus base per usare cloud (compensa costo percepito)
+            reward += self.config.bonus_cloud_usage * 0.5  # +40
+            
+            # Bonus extra se dati sono su cloud (evita transfer edge->cloud costoso)
+            if pipeline['data_location'] == 'cloud_cluster':
+                reward += self.config.bonus_cloud_usage * 0.5  # +40 extra → totale +80
         
         return reward
     
@@ -451,29 +481,18 @@ class CloudContinuumEnv(gym.Env):
         """
         Costruisce observation vector con feature engineering avanzato.
         
-        STRUTTURA STATE (POTENZIATA v2.0):
+        STRUTTURA STATE v2.1 - ENHANCED:
         - Per ogni cluster (9 features):
-            1. cpu_utilization (0-1)
-            2. memory_utilization (0-1)
-            3. cpu_available_normalized (0-1)
-            4. memory_available_normalized (0-1)
-            5. safety_margin (headroom)
-            6. stress_level (quanto è carico)
-            7. balance_score (equilibrio CPU-MEM)
-            8. headroom (spazio per crescita)
-            9. is_data_cluster (1 se contiene i dati)
+            1-9. (Come prima)
         
-        - Global features (6):
-            1. pipeline_cpu_normalized
-            2. pipeline_memory_normalized
-            3. placement_difficulty (stimato)
-            4. episode_progress (0-1)
-            5. success_rate_so_far
-            6. is_data_local_flag
+        - Global features (9 features - AUMENTATO da 6):
+            1-6. (Come prima)
+            7. Cloud vs Edge utilization ratio (NUOVO)
+            8. Edge clusters imbalance (NUOVO)
+            9. Data transfer cost estimate (NUOVO)
         
         - Temporal features (5):
-            1-4. Last 4 actions (one-hot encoded compresso)
-            5. avg_exec_time_so_far
+            1-5. (Come prima)
         
         Returns:
             State vector (numpy array)
@@ -491,7 +510,7 @@ class CloudContinuumEnv(gym.Env):
                 'data_location': "none"
             }
         
-        # === PER-CLUSTER FEATURES ===
+        # === PER-CLUSTER FEATURES (9 per cluster) ===
         for cluster_config in self.config.clusters:
             cluster = self.clusters_state[cluster_config.name]
             
@@ -503,19 +522,19 @@ class CloudContinuumEnv(gym.Env):
             cpu_avail_norm = cluster['cpu_available'] / max(cluster['cpu_capacity'], 1)
             mem_avail_norm = cluster['memory_available'] / max(cluster['memory_capacity'], 1)
             
-            # 5. Safety margin (quanto margine prima di saturo)
+            # 5. Safety margin
             safety_margin = min(cpu_avail_norm, mem_avail_norm)
             
-            # 6. Stress level (quanto è carico - combina utilization)
+            # 6. Stress level
             stress_level = (cpu_util + mem_util) / 2.0
             
-            # 7. Balance score (equilibrio tra CPU e MEM)
+            # 7. Balance score
             balance_score = 1.0 - abs(cpu_util - mem_util)
             
-            # 8. Headroom (capacità di assorbire workload futuri)
+            # 8. Headroom
             headroom = (cpu_avail_norm + mem_avail_norm) / 2.0
             
-            # 9. Is data cluster (pipeline corrente ha dati qui?)
+            # 9. Is data cluster
             is_data_cluster = 1.0 if cluster['name'] == pipeline['data_location'] else 0.0
             
             state.extend([
@@ -525,15 +544,15 @@ class CloudContinuumEnv(gym.Env):
                 headroom, is_data_cluster
             ])
         
-        # === GLOBAL FEATURES ===
-        # Normalize pipeline requirements rispetto a capacità media
+        # === GLOBAL FEATURES (9 features - AUMENTATO da 6) ===
+        # Normalize pipeline requirements
         avg_cpu_capacity = np.mean([c['cpu_capacity'] for c in self.clusters_state.values()])
         avg_mem_capacity = np.mean([c['memory_capacity'] for c in self.clusters_state.values()])
         
-        pipeline_cpu_norm = pipeline['cpu_required'] / avg_cpu_capacity
-        pipeline_mem_norm = pipeline['memory_required'] / avg_mem_capacity
+        pipeline_cpu_norm = pipeline['cpu_required'] / max(avg_cpu_capacity, 1)
+        pipeline_mem_norm = pipeline['memory_required'] / max(avg_mem_capacity, 1)
         
-        # Placement difficulty (quanto è difficile questo placement)
+        # Placement difficulty
         placement_difficulty = max(pipeline_cpu_norm, pipeline_mem_norm)
         
         # Episode progress
@@ -544,9 +563,10 @@ class CloudContinuumEnv(gym.Env):
         success_rate = (self.episode_stats['placements_successful'] / total_placements
                        if total_placements > 0 else 0.0)
         
-        # Data locality flag per pipeline corrente
+        # Data locality flag
         is_data_local = 1.0 if pipeline['data_location'] != "none" else 0.0
         
+        # Features 1-6 (originali)
         state.extend([
             pipeline_cpu_norm,
             pipeline_mem_norm,
@@ -556,16 +576,69 @@ class CloudContinuumEnv(gym.Env):
             is_data_local
         ])
         
-        # === TEMPORAL FEATURES ===
+        # ⚠️ NUOVE FEATURES 7-9 per bilanciamento
+        
+        # 7. Cloud vs Edge utilization ratio
+        cloud_clusters = [c for c in self.clusters_state.values() if c['cluster_type'] == 'cloud']
+        edge_clusters = [c for c in self.clusters_state.values() if c['cluster_type'] == 'edge']
+        
+        if cloud_clusters and edge_clusters:
+            cloud_avg_util = np.mean([(c['cpu_used']/max(c['cpu_capacity'], 1) + 
+                                       c['memory_used']/max(c['memory_capacity'], 1))/2.0 
+                                      for c in cloud_clusters])
+            edge_avg_util = np.mean([(c['cpu_used']/max(c['cpu_capacity'], 1) + 
+                                      c['memory_used']/max(c['memory_capacity'], 1))/2.0 
+                                     for c in edge_clusters])
+            cloud_edge_ratio = cloud_avg_util / (edge_avg_util + 1e-6)
+        else:
+            cloud_edge_ratio = 1.0
+        
+        state.append(cloud_edge_ratio)
+        
+        # 8. Edge clusters imbalance (variance)
+        if len(edge_clusters) > 1:
+            edge_utils = [(c['cpu_used']/max(c['cpu_capacity'], 1) + 
+                           c['memory_used']/max(c['memory_capacity'], 1))/2.0 
+                          for c in edge_clusters]
+            edge_imbalance = np.std(edge_utils)
+        else:
+            edge_imbalance = 0.0
+        
+        state.append(edge_imbalance)
+        
+        # 9. Data transfer cost estimate (se non è local)
+        if pipeline['data_location'] != 'none':
+            # Stima costo in base a distanza logica
+            data_loc = pipeline['data_location']
+            
+            # Calcola "distanza" media dai dati per ogni cluster possibile
+            transfer_costs = []
+            for cluster_config in self.config.clusters:
+                if cluster_config.name == data_loc:
+                    cost = 0.0  # Local
+                elif (data_loc == 'cloud_cluster' and cluster_config.cluster_type == 'edge') or \
+                     (cluster_config.name == 'cloud_cluster' and data_loc in [c.name for c in self.config.clusters if c.cluster_type == 'edge']):
+                    cost = 1.0  # Cloud<->Edge (alto)
+                else:
+                    cost = 0.5  # Edge<->Edge (medio)
+                transfer_costs.append(cost)
+            
+            avg_transfer_cost = np.mean(transfer_costs)
+        else:
+            avg_transfer_cost = 0.0
+        
+        state.append(avg_transfer_cost)
+        
+        # === TEMPORAL FEATURES (5) ===
         # Media execution time fino ad ora
         avg_exec_time = (np.mean(self.episode_stats['execution_times'])
                         if self.episode_stats['execution_times'] else 0.0)
-        avg_exec_time_norm = avg_exec_time / self.config.baseline_execution_time
+        avg_exec_time_norm = avg_exec_time / max(self.config.baseline_execution_time, 1)
         
         state.append(avg_exec_time_norm)
         
-        # Padding per temporal features (4 slot riservati per history)
-        state.extend([0.0] * 4)  # Placeholder per future features
+        # Padding per temporal features (4 slot riservati)
+        state.extend([0.0] * 4)
         
         return np.array(state, dtype=np.float32)
     
@@ -618,13 +691,14 @@ class CloudContinuumEnv(gym.Env):
 
 # ========== TESTING ==========
 if __name__ == "__main__":
-    print("Testing CloudContinuumEnv...")
+    print("Testing CloudContinuumEnv v2.1...")
     
     env = CloudContinuumEnv()
     
     print("\n1. Reset environment:")
     obs, info = env.reset(seed=42)
     print(f"  Observation shape: {obs.shape}")
+    print(f"  Expected shape: {env.config.total_state_size}")
     print(f"  Action space: {env.action_space}")
     print(f"  Pipelines in queue: {len(env.pipelines_queue)}")
     
@@ -651,3 +725,4 @@ if __name__ == "__main__":
             break
     
     print("\n✅ Environment test completed!")
+    print(f"✅ Cluster placements distribution: {info['cluster_placements']}")

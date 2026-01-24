@@ -10,7 +10,7 @@ import (
 const (
 	cloudClusterName       = "cloud_cluster"
 	defaultDataLocation    = "cloud_cluster"
-	heavyPipelineThreshold = 2000 // millicores
+	heavyPipelineThreshold = 1500 // millicores
 )
 
 // validateClusterAvailability verifica che un cluster sia disponibile.
