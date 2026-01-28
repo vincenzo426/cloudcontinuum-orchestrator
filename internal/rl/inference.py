@@ -1,360 +1,222 @@
-#!/usr/bin/env python3
-# internal/rl/inference.py
-"""
-Production inference module per CloudContinuum RL Agent (Versione Corretta)
-
-Correzioni effettuate:
-1. Sostituito PPO con MaskablePPO (sb3_contrib) per compatibilità con il training.
-2. Aggiunto supporto per action masking durante la predizione.
-3. Ottimizzato il caricamento del modello.
-"""
+# internal/rl/inference.py - Production Version (Standalone)
+"""API Flask per inference RL - Integrazione con controller Go."""
 
 import os
-import argparse
-import numpy as np
-from typing import Dict, List, Optional
-from flask import Flask, request, jsonify
 import logging
+import numpy as np
+from typing import Dict, Any
+from flask import Flask, request, jsonify
 
-# IMPORTANTE: Usa MaskablePPO invece di PPO se hai usato action masking nel training
+import gymnasium as gym
+from gymnasium import spaces
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from .environment import CloudContinuumEnv
-from .config import EnvironmentConfig, DEFAULT_CLUSTERS
+from .config import ClusterConfig, DEFAULT_CLUSTERS, PipelineSizeCategory
 
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class RLPlacementAgent:
-    """
-    RL Agent per placement inference in produzione.
-    Carica modello MaskablePPO e fornisce predizioni con supporto VecNormalize.
-    """
+class DummyEnv(gym.Env):
+    """Environment minimale per caricare il modello."""
+    def __init__(self):
+        super().__init__()
+        self.observation_space = spaces.Box(low=-1.0, high=2.0, shape=(28,), dtype=np.float32)
+        self.action_space = spaces.Discrete(4)
     
-    def __init__(
-        self, 
-        model_path: str, 
-        vec_normalize_path: Optional[str] = None,
-        config: Optional[EnvironmentConfig] = None
-    ):
-        logger.info(f"Loading RL model from: {model_path}")
-        
+    def reset(self, seed=None, options=None):
+        return np.zeros(28, dtype=np.float32), {}
+    
+    def step(self, action):
+        return np.zeros(28, dtype=np.float32), 0.0, True, False, {}
+    
+    def action_masks(self):
+        return np.ones(4, dtype=bool)
+
+
+class RLPlacementAgent:
+    """Agente RL per placement pipeline in produzione."""
+    
+    def __init__(self, model_path: str, vec_normalize_path: str = None):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found: {model_path}")
         
-        # Config
-        if config is None:
-            config = EnvironmentConfig(
-                clusters=DEFAULT_CLUSTERS,
-                pipelines_per_episode=1,
-                max_episode_steps=1,
-                master_seed=0
-            )
-        self.config = config
+        self.clusters = DEFAULT_CLUSTERS
+        self.cluster_names = [c.name for c in self.clusters]
         
-        # Create dummy environment
-        def make_env():
-            return CloudContinuumEnv(config=self.config, seed=0)
+        # Dummy env per caricare modello
+        self.env = DummyVecEnv([lambda: DummyEnv()])
         
-        self.env = DummyVecEnv([make_env])
-        
-        # Carica VecNormalize wrapper se presente
         if vec_normalize_path and os.path.exists(vec_normalize_path):
-            logger.info(f"Loading VecNormalize from: {vec_normalize_path}")
             self.env = VecNormalize.load(vec_normalize_path, self.env)
             self.env.training = False
             self.env.norm_reward = False
-            logger.info("✅ VecNormalize loaded successfully")
+            self._has_normalize = True
         else:
-            logger.warning("⚠️ Running WITHOUT VecNormalize - results might be suboptimal!")
+            self._has_normalize = False
         
-        # CARICAMENTO CORRETTO: Usa MaskablePPO
         self.model = MaskablePPO.load(model_path, env=self.env)
-        logger.info("✅ MaskablePPO Model loaded successfully")
+        logger.info(f"✅ RLPlacementAgent loaded: {model_path}")
     
-    def predict_placement(
-        self,
-        pipeline_request: Dict,
-        clusters_state: Dict[str, Dict],
-        deterministic: bool = True
-    ) -> Dict:
+    def predict(self, pipeline: Dict, clusters_state: Dict) -> Dict[str, Any]:
+        """Predice cluster target per una pipeline."""
         try:
-            # 1. Costruisci observation (NON normalizzata)
-            obs = self._build_observation(pipeline_request, clusters_state)
+            obs = self._build_observation(pipeline, clusters_state)
+            mask = self._build_action_mask(pipeline, clusters_state)
             
-            # 2. Calcola Action Mask per l'inferenza
-            # Questo assicura che il modello non scelga cluster che non soddisfano i requisiti
-            action_masks = self._get_inference_action_mask(pipeline_request, clusters_state)
+            if not mask.any():
+                return {'target_cluster': None, 'confidence': 0.0,
+                        'action_probabilities': {},
+                        'reason': 'No cluster has sufficient resources', 'is_valid': False}
             
-            # 3. Predict usando MaskablePPO con action_masks
-            action, _states = self.model.predict(
-                obs, 
-                action_masks=action_masks, 
-                deterministic=deterministic
-            )
-            action = int(action[0])
+            if self._has_normalize:
+                obs = self.env.normalize_obs(obs)
             
-            # 4. Calcola probabilità e confidenza
-            obs_tensor = self.model.policy.obs_to_tensor(obs)[0]
-            with np.errstate(all='ignore'):
-                # get_distribution richiede l'osservazione e opzionalmente la maschera
-                distribution = self.model.policy.get_distribution(obs_tensor)
-                # Applichiamo la maschera alle probabilità se necessario
-                probs = distribution.distribution.probs.detach().cpu().numpy()[0]
+            action, _ = self.model.predict(obs, deterministic=True, action_masks=mask)
+            action = int(action[0]) if hasattr(action, '__len__') else int(action)
             
-            target_cluster = self.config.clusters[action].name
+            target = self.cluster_names[action]
+            probs = self._get_probs(obs, mask)
             confidence = float(probs[action])
             
-            action_probs = {
-                cluster.name: float(probs[idx])
-                for idx, cluster in enumerate(self.config.clusters)
-            }
-            
-            reason = self._generate_reason(
-                pipeline_request, clusters_state, target_cluster, confidence
+            size_cat, _ = PipelineSizeCategory.classify(
+                pipeline.get('cpu_required', 0),
+                pipeline.get('memory_required', 0)
             )
+            reason = f"RL: {size_cat} pipeline → {target}, conf: {confidence:.0%}"
             
-            return {
-                'target_cluster': target_cluster,
-                'confidence': confidence,
-                'reason': reason,
-                'action_probabilities': action_probs
+            # Action probabilities per ogni cluster
+            action_probabilities = {
+                name: float(probs[i]) for i, name in enumerate(self.cluster_names)
             }
-        
+            
+            return {'target_cluster': target, 'confidence': confidence,
+                    'action_probabilities': action_probabilities,
+                    'reason': reason, 'is_valid': True}
         except Exception as e:
-            logger.error(f"Prediction error: {e}", exc_info=True)
-            raise
-
-    def _get_inference_action_mask(self, pipeline_req: Dict, clusters_state: Dict) -> np.ndarray:
-        """Calcola la maschera di validità dei cluster in tempo reale"""
-        mask = np.ones(len(self.config.clusters), dtype=np.int8)
-        cpu_req = pipeline_req.get('cpu_required', 0)
-        mem_req = pipeline_req.get('memory_required', 0)
-
-        for i, cluster_cfg in enumerate(self.config.clusters):
-            state = clusters_state.get(cluster_cfg.name)
-            if not state:
-                mask[i] = 0
-                continue
-            
-            # Se il cluster non ha risorse sufficienti, invalida l'azione
-            if state['cpu_available'] < cpu_req or state['memory_available'] < mem_req:
-                mask[i] = 0
-        
-        # Se tutti i cluster sono invalidi (caso estremo), permetti tutto per evitare crash
-        if np.sum(mask) == 0:
-            return np.ones(len(self.config.clusters), dtype=np.int8)
-        return mask
-
-    def _build_observation(self, pipeline_request: Dict, clusters_state: Dict) -> np.ndarray:
-        """
-        Costruisce il vettore di osservazione (50 features - ALIGNED con environment v2.1)
-        
-        Structure:
-        - Per-cluster: 9 × 4 = 36 features
-        - Global: 9 features (6 originali + 3 nuove)
-        - Temporal: 5 features
-        Total: 50 features
-        """
-        obs_parts = []
-        
-        # === PER-CLUSTER FEATURES (9 × 4 = 36) ===
-        for cluster_cfg in self.config.clusters:
-            cluster = clusters_state[cluster_cfg.name]
-            
-            # Utilization
-            cpu_util = 1.0 - (cluster['cpu_available'] / max(cluster['cpu_capacity'], 1))
-            mem_util = 1.0 - (cluster['memory_available'] / max(cluster['memory_capacity'], 1))
-            
-            # Available (normalized)
-            cpu_avail_norm = cluster['cpu_available'] / max(cluster['cpu_capacity'], 1)
-            mem_avail_norm = cluster['memory_available'] / max(cluster['memory_capacity'], 1)
-            
-            # Safety margin
-            safety_margin = min(cpu_avail_norm, mem_avail_norm)
-            
-            # Stress level
-            stress_level = (cpu_util + mem_util) / 2.0
-            
-            # Balance score
-            balance_score = 1.0 - abs(cpu_util - mem_util)
-            
-            # Headroom
-            headroom = (cpu_avail_norm + mem_avail_norm) / 2.0
-            
-            # Is data cluster
-            is_data_cluster = 1.0 if cluster_cfg.name == pipeline_request['data_location'] else 0.0
-            
-            obs_parts.extend([
-                cpu_util, mem_util,
-                cpu_avail_norm, mem_avail_norm,
-                safety_margin, stress_level, balance_score,
-                headroom, is_data_cluster
-            ])
-        
-        # === GLOBAL FEATURES (9 total) ===
-        # Normalize pipeline requirements
-        avg_cpu_capacity = np.mean([c['cpu_capacity'] for c in clusters_state.values()])
-        avg_mem_capacity = np.mean([c['memory_capacity'] for c in clusters_state.values()])
-        
-        pipeline_cpu_norm = pipeline_request['cpu_required'] / max(avg_cpu_capacity, 1)
-        pipeline_mem_norm = pipeline_request['memory_required'] / max(avg_mem_capacity, 1)
-        
-        # Placement difficulty
-        placement_difficulty = max(pipeline_cpu_norm, pipeline_mem_norm)
-        
-        # Episode progress (dummy in inference)
-        episode_progress = 0.0
-        
-        # Success rate (dummy in inference)
-        success_rate = 1.0
-        
-        # Data locality flag
-        is_data_local = 1.0 if pipeline_request['data_location'] != "none" else 0.0
-        
-        # Features 1-6 (originali)
-        obs_parts.extend([
-            pipeline_cpu_norm,
-            pipeline_mem_norm,
-            placement_difficulty,
-            episode_progress,
-            success_rate,
-            is_data_local
-        ])
-        
-        # ⚠️ NUOVE FEATURES 7-9 (MANCANTI NELLA VERSIONE ATTUALE)
-        
-        # 7. Cloud vs Edge utilization ratio
-        cloud_clusters = [c for cname, c in clusters_state.items() 
-                        if any(cfg.name == cname and cfg.cluster_type == 'cloud' 
-                                for cfg in self.config.clusters)]
-        edge_clusters = [c for cname, c in clusters_state.items() 
-                        if any(cfg.name == cname and cfg.cluster_type == 'edge' 
-                            for cfg in self.config.clusters)]
-        
-        if cloud_clusters and edge_clusters:
-            cloud_avg_util = np.mean([
-                (c['cpu_capacity'] - c['cpu_available']) / max(c['cpu_capacity'], 1) +
-                (c['memory_capacity'] - c['memory_available']) / max(c['memory_capacity'], 1)
-                for c in cloud_clusters
-            ]) / 2.0
-            
-            edge_avg_util = np.mean([
-                (c['cpu_capacity'] - c['cpu_available']) / max(c['cpu_capacity'], 1) +
-                (c['memory_capacity'] - c['memory_available']) / max(c['memory_capacity'], 1)
-                for c in edge_clusters
-            ]) / 2.0
-            
-            cloud_edge_ratio = cloud_avg_util / (edge_avg_util + 1e-6)
-        else:
-            cloud_edge_ratio = 1.0
-        
-        obs_parts.append(cloud_edge_ratio)
-        
-        # 8. Edge clusters imbalance (variance)
-        if len(edge_clusters) > 1:
-            edge_utils = [
-                ((c['cpu_capacity'] - c['cpu_available']) / max(c['cpu_capacity'], 1) +
-                (c['memory_capacity'] - c['memory_available']) / max(c['memory_capacity'], 1)) / 2.0
-                for c in edge_clusters
-            ]
-            edge_imbalance = np.std(edge_utils)
-        else:
-            edge_imbalance = 0.0
-        
-        obs_parts.append(edge_imbalance)
-        
-        # 9. Data transfer cost estimate
-        if pipeline_request['data_location'] != 'none':
-            data_loc = pipeline_request['data_location']
-            
-            # Trova il tipo del cluster con i dati
-            data_cluster_type = None
-            for cfg in self.config.clusters:
-                if cfg.name == data_loc:
-                    data_cluster_type = cfg.cluster_type
-                    break
-            
-            # Calcola costo medio trasferimento
-            transfer_costs = []
-            for cfg in self.config.clusters:
-                if cfg.name == data_loc:
-                    cost = 0.0  # Local
-                elif (data_cluster_type == 'cloud' and cfg.cluster_type == 'edge') or \
-                    (data_cluster_type == 'edge' and cfg.cluster_type == 'cloud'):
-                    cost = 1.0  # Cloud<->Edge (alto)
-                else:
-                    cost = 0.5  # Edge<->Edge (medio)
-                transfer_costs.append(cost)
-            
-            avg_transfer_cost = np.mean(transfer_costs)
-        else:
-            avg_transfer_cost = 0.0
-        
-        obs_parts.append(avg_transfer_cost)
-        
-        # === TEMPORAL FEATURES (5) ===
-        obs_parts.extend([0.0] * 5)  # Dummy temporal features
-        
-        # Reshape to (1, 50)
-        obs = np.array(obs_parts, dtype=np.float32).reshape(1, -1)
-        
-        # Validate shape
-        assert obs.shape == (1, 50), f"Wrong observation shape: {obs.shape}, expected (1, 50)"
+            logger.error(f"Prediction failed: {e}")
+            return {'target_cluster': None, 'confidence': 0.0,
+                    'action_probabilities': {},
+                    'reason': f'Error: {str(e)}', 'is_valid': False}
     
-        return obs
+    def _build_observation(self, pipeline: Dict, clusters_state: Dict) -> np.ndarray:
+        """Costruisce observation vector (28 features)."""
+        obs = []
+        cpu_req = pipeline.get('cpu_required', 0)
+        mem_req = pipeline.get('memory_required', 0)
+        data_loc = pipeline.get('data_location', 'distributed')
+        
+        # Per-cluster features (5 × 4 = 20)
+        for c in self.clusters:
+            state = clusters_state.get(c.name, {})
+            cpu_cap = state.get('cpu_capacity', c.cpu_capacity)
+            cpu_avail = state.get('cpu_available', c.cpu_available)
+            mem_cap = state.get('memory_capacity', c.memory_capacity)
+            mem_avail = state.get('memory_available', c.memory_available)
+            
+            obs.append(cpu_avail / cpu_cap if cpu_cap > 0 else 0.0)
+            obs.append(mem_avail / mem_cap if mem_cap > 0 else 0.0)
+            obs.append(1.0 if data_loc == c.name else 0.0)
+            obs.append(1.0 if cpu_avail >= cpu_req and mem_avail >= mem_req else 0.0)
+            obs.append(1.0 if c.cluster_type == "cloud" else 0.0)
+        
+        # Pipeline features (4)
+        max_cpu = max(clusters_state.get(c.name, {}).get('cpu_available', c.cpu_available) for c in self.clusters)
+        max_mem = max(clusters_state.get(c.name, {}).get('memory_available', c.memory_available) for c in self.clusters)
+        _, size_val = PipelineSizeCategory.classify(cpu_req, mem_req)
+        fits_edge = any(clusters_state.get(c.name, {}).get('cpu_available', 0) >= cpu_req and
+                        clusters_state.get(c.name, {}).get('memory_available', 0) >= mem_req
+                        for c in self.clusters if c.cluster_type == "edge")
+        
+        obs.append(min(cpu_req / max_cpu, 2.0) if max_cpu > 0 else 0.0)
+        obs.append(min(mem_req / max_mem, 2.0) if max_mem > 0 else 0.0)
+        obs.append(size_val)
+        obs.append(1.0 if fits_edge else 0.0)
+        
+        # Global features (4)
+        cloud = clusters_state.get('cloud_cluster', {})
+        cloud_headroom = cloud.get('cpu_available', 0) / cloud.get('cpu_capacity', 8000)
+        
+        edge_utils = []
+        for c in self.clusters:
+            if c.cluster_type == "edge" and c.name in clusters_state:
+                s = clusters_state[c.name]
+                edge_utils.append(1.0 - s.get('cpu_available', 0) / s.get('cpu_capacity', 1))
+        
+        obs.append(cloud_headroom)
+        obs.append(np.mean(edge_utils) if edge_utils else 0.0)
+        obs.append(0.0)  # variance placeholder
+        obs.append(1.0)  # single pipeline
+        
+        return np.array(obs, dtype=np.float32).reshape(1, -1)
+    
+    def _build_action_mask(self, pipeline: Dict, clusters_state: Dict) -> np.ndarray:
+        """Action mask: True = cluster può ospitare pipeline."""
+        cpu_req = pipeline.get('cpu_required', 0)
+        mem_req = pipeline.get('memory_required', 0)
+        mask = np.zeros(len(self.clusters), dtype=bool)
+        
+        for i, c in enumerate(self.clusters):
+            state = clusters_state.get(c.name, {})
+            if state.get('cpu_available', c.cpu_available) >= cpu_req and \
+               state.get('memory_available', c.memory_available) >= mem_req:
+                mask[i] = True
+        return mask
+    
+    def _get_probs(self, obs: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Ottiene probabilità per ogni azione."""
+        try:
+            obs_tensor = self.model.policy.obs_to_tensor(obs)[0]
+            dist = self.model.policy.get_distribution(obs_tensor)
+            probs = dist.distribution.probs.detach().cpu().numpy()[0]
+            probs = probs * mask
+            return probs / probs.sum() if probs.sum() > 0 else probs
+        except:
+            probs = mask.astype(float)
+            return probs / probs.sum() if probs.sum() > 0 else probs
 
-    def _generate_reason(self, pipeline_request: Dict, clusters_state: Dict, target: str, conf: float) -> str:
-        reasons = []
-        if target == pipeline_request['data_location']: reasons.append("data locality")
-        target_state = clusters_state[target]
-        cpu_util = 1.0 - (target_state['cpu_available'] / target_state['cpu_capacity'])
-        reasons.append("optimal load" if cpu_util < 0.7 else "high capacity")
-        reasons.append(f"conf: {conf:.1%}")
-        return f"RL: {', '.join(reasons)}"
 
-
-# Flask API
+# === FLASK API ===
 app = Flask(__name__)
-agent: Optional[RLPlacementAgent] = None
+agent: RLPlacementAgent = None
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'model_loaded': agent is not None,
-        'model_type': 'MaskablePPO' if agent else None
-    })
+def health():
+    return jsonify({'status': 'healthy', 'model_loaded': agent is not None})
 
 @app.route('/predict', methods=['POST'])
 def predict():
     if agent is None:
-        return jsonify({'error': 'Model not loaded'}), 500
-    try:
-        data = request.get_json()
-        result = agent.predict_placement(data['pipeline'], data['clusters'])
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Model not loaded'}), 503
+    
+    data = request.get_json()
+    if not data or 'pipeline' not in data or 'clusters' not in data:
+        return jsonify({'error': 'Missing pipeline or clusters'}), 400
+    
+    result = agent.predict(data['pipeline'], data['clusters'])
+    return jsonify(result)
 
-def main():
+
+def run_server(model_path: str, vec_normalize_path: str = None, host: str = '0.0.0.0', port: int = 5000):
+    """Avvia server Flask."""
+    global agent
+    agent = RLPlacementAgent(model_path, vec_normalize_path)
+    logger.info(f"🚀 Starting server on {host}:{port}")
+    app.run(host=host, port=port, threaded=True)
+
+
+if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, required=True)
-    parser.add_argument("--vec-normalize-path", type=str, default=None)
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--vec-normalize-path", default=None)
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
     
-    global agent
-    agent = RLPlacementAgent(args.model_path, args.vec_normalize_path)
-    app.run(host=args.host, port=args.port, debug=False)
-
-if __name__ == "__main__":
-    main()
+    vec_path = args.vec_normalize_path
+    if not vec_path:
+        vec_path = os.path.join(os.path.dirname(args.model_path), "vec_normalize.pkl")
+    
+    run_server(args.model_path, vec_path, args.host, args.port)

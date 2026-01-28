@@ -1,292 +1,466 @@
 # internal/rl/simulator.py
 """
-Simulatori per execution time e network latency
-Modelli realistici basati su dati produzione CloudContinuum
+CloudContinuum RL - Simulation Module
+VERSIONE 4.0 - REALISTIC EXECUTION TIME MODEL
+
+Modelli di simulazione per:
+1. Tempo di esecuzione pipeline (funzione di CPU, locality, contesa)
+2. Latenza di rete tra cluster
+3. Costo trasferimento dati
+
+Il tempo di esecuzione è l'OBIETTIVO PRIMARIO da minimizzare.
 """
 
 import numpy as np
-from typing import Dict
+from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
 
 
-class ExecutionTimeSimulator:
-    """
-    Simula execution time di pipeline basato su risorse e latenza.
-    
-    MODELLO:
-    exec_time = base_time * (1 + cpu_factor + memory_factor + network_factor)
-    
-    - base_time: Tempo baseline per pipeline (~60s)
-    - cpu_factor: Penalità se CPU scarso
-    - memory_factor: Penalità se memoria scarsa
-    - network_factor: Overhead da data transfer remoto
-    """
-    
-    def __init__(self, base_time: float = 60.0):
-        self.base_time = base_time
-        
-        # Pesi componenti (devono sommare a 1.0)
-        self.cpu_weight = 0.5
-        self.memory_weight = 0.3
-        self.network_weight = 0.2
-        
-        # Soglie per penalità
-        self.cpu_shortage_threshold = 0.7      # Se < 30% disponibile
-        self.memory_shortage_threshold = 0.6   # Se < 40% disponibile
-    
-    def simulate(
-        self,
-        pipeline_cpu: int,                  # millicores richiesti
-        pipeline_memory: int,               # bytes richiesti
-        cluster_cpu_available: int,         # millicores disponibili
-        cluster_memory_available: int,      # bytes disponibili
-        network_latency: float = 0.0,       # ms
-        is_data_local: bool = True
-    ) -> float:
-        """
-        Simula execution time (in secondi).
-        
-        Returns:
-            Execution time in secondi
-        """
-        # Base time
-        exec_time = self.base_time
-        
-        # CPU factor: penalità se risorse scarse
-        cpu_utilization = pipeline_cpu / max(cluster_cpu_available, 1)
-        if cpu_utilization > self.cpu_shortage_threshold:
-            # Overhead proporzionale alla scarsità
-            cpu_penalty = (cpu_utilization - self.cpu_shortage_threshold) * 2.0
-            exec_time += cpu_penalty * self.base_time * self.cpu_weight
-        
-        # Memory factor
-        memory_utilization = pipeline_memory / max(cluster_memory_available, 1)
-        if memory_utilization > self.memory_shortage_threshold:
-            memory_penalty = (memory_utilization - self.memory_shortage_threshold) * 1.5
-            exec_time += memory_penalty * self.base_time * self.memory_weight
-        
-        # Network factor: data transfer overhead
-        if not is_data_local:
-            # Convert network latency (ms) to seconds
-            transfer_overhead = (network_latency / 1000.0) * 10  # Assume 10x latency
-            exec_time += transfer_overhead * self.network_weight
-        
-        # Add random variance (±10%)
-        noise = np.random.uniform(-0.1, 0.1) * exec_time
-        exec_time += noise
-        
-        # Ensure non-negative
-        exec_time = max(exec_time, 1.0)
-        
-        return exec_time
-
+# =============================================================================
+# NETWORK LATENCY MODEL
+# =============================================================================
 
 class NetworkLatencyModel:
     """
     Modello di latenza di rete tra cluster.
     
-    BASATO SU MISURAZIONE REALE (dai log collector):
-    - Cloud ↔ Edge: 30-60ms
-    - Edge ↔ Edge: 10-20ms
-    - Same cluster: 0ms
+    Latenza dipende da:
+    - Distanza geografica (approssimata da latency_to_cloud)
+    - Se source == destination → 0ms (locale)
+    - Se uno dei due è cloud → latency_to_cloud del cluster edge
+    - Se entrambi edge → somma delle latenze (passano per cloud)
     """
     
-    def __init__(self):
-        # Latency matrix (ms) - simmetrica
-        self.latency_matrix = {
-            # Cloud cluster
-            ("cloud_cluster", "edge_cluster_1"): self._random_latency(35, 55),
-            ("cloud_cluster", "edge_cluster_2"): self._random_latency(30, 50),
-            ("cloud_cluster", "edge_cluster_3"): self._random_latency(40, 60),
-            
-            # Edge cluster 1
-            ("edge_cluster_1", "cloud_cluster"): self._random_latency(35, 55),
-            ("edge_cluster_1", "edge_cluster_2"): self._random_latency(12, 18),
-            ("edge_cluster_1", "edge_cluster_3"): self._random_latency(10, 16),
-            
-            # Edge cluster 2
-            ("edge_cluster_2", "cloud_cluster"): self._random_latency(30, 50),
-            ("edge_cluster_2", "edge_cluster_1"): self._random_latency(12, 18),
-            ("edge_cluster_2", "edge_cluster_3"): self._random_latency(11, 17),
-            
-            # Edge cluster 3
-            ("edge_cluster_3", "cloud_cluster"): self._random_latency(40, 60),
-            ("edge_cluster_3", "edge_cluster_1"): self._random_latency(10, 16),
-            ("edge_cluster_3", "edge_cluster_2"): self._random_latency(11, 17),
-        }
-    
-    def _random_latency(self, min_ms: float, max_ms: float) -> float:
-        """Genera latenza casuale nel range specificato"""
-        return np.random.uniform(min_ms, max_ms)
-    
-    def get_latency(self, source_cluster: str, target_cluster: str) -> float:
+    def __init__(self, clusters_config: list = None):
         """
-        Ritorna latenza di rete (ms) tra due cluster.
+        Inizializza modello latenza.
         
         Args:
-            source_cluster: Nome cluster sorgente
-            target_cluster: Nome cluster destinazione
+            clusters_config: Lista di ClusterConfig
+        """
+        self.latency_matrix: Dict[str, Dict[str, float]] = {}
+        
+        if clusters_config:
+            self._build_latency_matrix(clusters_config)
+    
+    def _build_latency_matrix(self, clusters: list):
+        """Costruisce matrice di latenza tra tutti i cluster."""
+        for src in clusters:
+            self.latency_matrix[src.name] = {}
+            for dst in clusters:
+                if src.name == dst.name:
+                    # Stesso cluster = locale
+                    self.latency_matrix[src.name][dst.name] = 0.0
+                elif src.cluster_type == "cloud":
+                    # Cloud → Edge = latenza dell'edge
+                    self.latency_matrix[src.name][dst.name] = dst.latency_to_cloud
+                elif dst.cluster_type == "cloud":
+                    # Edge → Cloud = latenza dell'edge sorgente
+                    self.latency_matrix[src.name][dst.name] = src.latency_to_cloud
+                else:
+                    # Edge → Edge = passano per cloud (somma latenze)
+                    self.latency_matrix[src.name][dst.name] = \
+                        src.latency_to_cloud + dst.latency_to_cloud
+    
+    def get_latency(self, source: str, destination: str) -> float:
+        """
+        Ritorna latenza in millisecondi tra due cluster.
+        
+        Args:
+            source: Nome cluster sorgente (dove sono i dati)
+            destination: Nome cluster destinazione (dove esegue la pipeline)
         
         Returns:
-            Latenza in millisecondi
+            Latenza in ms
         """
-        # Same cluster = 0 latency
-        if source_cluster == target_cluster:
+        if source in self.latency_matrix and destination in self.latency_matrix[source]:
+            return self.latency_matrix[source][destination]
+        
+        # Fallback: nessuna latenza se non configurato
+        return 0.0
+    
+    def get_transfer_time(self, source: str, destination: str, 
+                          data_size_bytes: int = 1024 * 1024 * 100) -> float:
+        """
+        Stima tempo di trasferimento dati in secondi.
+        
+        Modello semplificato:
+        - Bandwidth stimata ~100 Mbps tra cluster
+        - Latenza aggiunge overhead fisso
+        
+        Args:
+            source: Cluster sorgente
+            destination: Cluster destinazione
+            data_size_bytes: Dimensione dati (default 100MB)
+        
+        Returns:
+            Tempo trasferimento in secondi
+        """
+        if source == destination:
             return 0.0
         
-        # Lookup in matrix
-        key = (source_cluster, target_cluster)
-        if key in self.latency_matrix:
-            # Add jitter (±5ms)
-            base_latency = self.latency_matrix[key]
-            jitter = np.random.uniform(-5, 5)
-            return max(base_latency + jitter, 0.0)
+        latency_ms = self.get_latency(source, destination)
+        latency_sec = latency_ms / 1000.0
         
-        # Default: assume edge-to-edge latency
-        return self._random_latency(10, 20)
+        # Bandwidth stimata: 100 Mbps = 12.5 MB/s
+        bandwidth_bytes_per_sec = 12.5 * 1024 * 1024
+        transfer_time = data_size_bytes / bandwidth_bytes_per_sec
+        
+        # Tempo totale = latenza + trasferimento
+        return latency_sec + transfer_time
+
+
+# =============================================================================
+# EXECUTION TIME SIMULATOR
+# =============================================================================
+
+class ExecutionTimeSimulator:
+    """
+    Simula il tempo di esecuzione di una pipeline.
     
-    def get_bandwidth_estimate(
+    Il tempo dipende da:
+    1. DIMENSIONE PIPELINE: più CPU richiesta = più tempo
+    2. DATA LOCALITY: se dati non locali → overhead trasferimento
+    3. CONTESA RISORSE: cluster più carico = esecuzione più lenta
+    
+    Formula:
+        exec_time = base_time * contention_factor + transfer_overhead
+    
+    Dove:
+        base_time = cpu_required / 1000 * time_per_core
+        contention_factor = 1.0 + (cluster_utilization * contention_impact)
+        transfer_overhead = latency * latency_impact (se non locale)
+    """
+    
+    def __init__(
         self,
-        source_cluster: str,
-        target_cluster: str
+        time_per_cpu_core: float = 30.0,
+        latency_impact_factor: float = 0.5,
+        contention_impact_factor: float = 0.5,
+        baseline_time: float = 60.0
+    ):
+        """
+        Inizializza simulatore.
+        
+        Args:
+            time_per_cpu_core: Secondi per CPU core richiesto (default 30s)
+            latency_impact_factor: Quanto la latenza impatta il tempo (0-1)
+            contention_impact_factor: Quanto la contesa impatta il tempo (0-1)
+            baseline_time: Tempo baseline per normalizzazione
+        """
+        self.time_per_cpu_core = time_per_cpu_core
+        self.latency_impact_factor = latency_impact_factor
+        self.contention_impact_factor = contention_impact_factor
+        self.baseline_time = baseline_time
+    
+    def simulate(
+        self,
+        pipeline_cpu: int,
+        pipeline_memory: int,
+        cluster_cpu_utilization: float,
+        cluster_memory_utilization: float,
+        network_latency_ms: float,
+        is_data_local: bool
     ) -> float:
         """
-        Stima bandwidth (Mbps) tra due cluster.
+        Simula tempo di esecuzione della pipeline.
         
-        ASSUNZIONI REALISTICHE:
-        - Cloud ↔ Edge: 100 Mbps (WAN)
-        - Edge ↔ Edge: 1 Gbps (LAN)
-        """
-        if source_cluster == target_cluster:
-            return float('inf')  # Infinito bandwidth (locale)
-        
-        # Cloud involved = WAN bandwidth
-        if "cloud" in source_cluster or "cloud" in target_cluster:
-            return 100.0  # Mbps
-        
-        # Edge-to-edge = LAN bandwidth
-        return 1000.0  # Mbps (1 Gbps)
-
-
-class ResourceUtilizationSimulator:
-    """
-    Simula dinamica di utilizzo risorse nel tempo.
-    
-    UTILE PER: Simulare variazioni realistiche di baseline utilization
-    durante episodi lunghi.
-    """
-    
-    def __init__(self, update_interval: int = 10):
-        """
         Args:
-            update_interval: Ogni quanti step aggiornare baseline
+            pipeline_cpu: CPU richiesta in millicores
+            pipeline_memory: Memoria richiesta in bytes
+            cluster_cpu_utilization: Utilizzo CPU del cluster (0-1)
+            cluster_memory_utilization: Utilizzo memoria del cluster (0-1)
+            network_latency_ms: Latenza di rete in ms (se dati remoti)
+            is_data_local: True se i dati sono sul cluster di esecuzione
+        
+        Returns:
+            Tempo di esecuzione stimato in secondi
         """
-        self.update_interval = update_interval
-        self.step_counter = 0
+        # 1. TEMPO BASE (proporzionale a CPU richiesta)
+        # 1000m = 1 core → 30 secondi base
+        cpu_cores = pipeline_cpu / 1000.0
+        base_time = cpu_cores * self.time_per_cpu_core
+        
+        # Minimo 10 secondi per qualsiasi pipeline
+        base_time = max(10.0, base_time)
+        
+        # 2. FATTORE CONTESA (cluster carico = più lento)
+        # Media tra utilizzo CPU e memoria
+        avg_utilization = (cluster_cpu_utilization + cluster_memory_utilization) / 2.0
+        
+        # Contesa: da 1.0 (cluster vuoto) a 1.5 (cluster saturo)
+        contention_factor = 1.0 + (avg_utilization * self.contention_impact_factor)
+        
+        # 3. OVERHEAD TRASFERIMENTO DATI
+        transfer_overhead = 0.0
+        if not is_data_local:
+            # Latenza aggiunge overhead (convertita in secondi * fattore impatto)
+            transfer_overhead = (network_latency_ms / 1000.0) * self.latency_impact_factor * 10.0
+            
+            # Overhead minimo per trasferimento: 2 secondi
+            transfer_overhead = max(2.0, transfer_overhead)
+        
+        # 4. TEMPO FINALE
+        exec_time = (base_time * contention_factor) + transfer_overhead
+        
+        # Aggiungi variabilità realistica (±10%)
+        noise = np.random.uniform(-0.1, 0.1)
+        exec_time *= (1.0 + noise)
+        
+        return round(exec_time, 2)
     
-    def update_cluster_baseline(self, cluster: Dict) -> Dict:
+    def normalize_time(self, exec_time: float) -> float:
         """
-        Aggiorna baseline utilization con variazione random.
+        Normalizza tempo rispetto al baseline.
         
-        Simula workload esterno che entra/esce dal cluster.
+        Returns:
+            Tempo normalizzato (1.0 = baseline, <1.0 = veloce, >1.0 = lento)
         """
-        self.step_counter += 1
+        return exec_time / self.baseline_time
+
+
+# =============================================================================
+# RESOURCE CONTENTION MODEL
+# =============================================================================
+
+class ResourceContentionModel:
+    """
+    Modella la contesa delle risorse su un cluster.
+    
+    Quando un cluster è carico:
+    - Le pipeline esistenti competono per CPU/memoria
+    - Le nuove pipeline subiscono rallentamenti
+    - Il rischio di OOM/throttling aumenta
+    """
+    
+    @staticmethod
+    def get_contention_score(cpu_utilization: float, 
+                             memory_utilization: float) -> float:
+        """
+        Calcola score di contesa (0 = nessuna, 1 = massima).
         
-        if self.step_counter % self.update_interval != 0:
-            return cluster  # No update
+        Args:
+            cpu_utilization: Utilizzo CPU (0-1)
+            memory_utilization: Utilizzo memoria (0-1)
         
-        # Random variation: ±5% della capacità
-        cpu_variation = int(np.random.uniform(-0.05, 0.05) * cluster['cpu_capacity'])
-        mem_variation = int(np.random.uniform(-0.05, 0.05) * cluster['memory_capacity'])
+        Returns:
+            Score di contesa (0-1)
+        """
+        # Peso maggiore a CPU (più critica per performance)
+        weighted_util = (cpu_utilization * 0.6) + (memory_utilization * 0.4)
         
-        # Apply variation (con clipping)
-        new_cpu_used = np.clip(
-            cluster['cpu_used'] + cpu_variation,
-            0,
-            cluster['cpu_capacity']
+        # Contesa cresce esponenzialmente dopo 70% utilizzo
+        if weighted_util < 0.7:
+            return weighted_util * 0.5  # Lineare fino a 70%
+        else:
+            # Esponenziale dopo 70%
+            excess = weighted_util - 0.7
+            return 0.35 + (excess * 2.0) ** 1.5
+    
+    @staticmethod
+    def get_failure_probability(cpu_utilization: float,
+                                memory_utilization: float,
+                                pipeline_cpu_ratio: float,
+                                pipeline_memory_ratio: float) -> float:
+        """
+        Stima probabilità di fallimento del placement.
+        
+        Anche se nominalmente c'è spazio, un cluster molto carico
+        potrebbe avere problemi di scheduling.
+        
+        Returns:
+            Probabilità di fallimento (0-1)
+        """
+        # Se cluster è sotto 80% utilizzo, probabilità quasi zero
+        if cpu_utilization < 0.8 and memory_utilization < 0.8:
+            return 0.0
+        
+        # Sopra 90%, probabilità aumenta rapidamente
+        max_util = max(cpu_utilization, memory_utilization)
+        
+        if max_util < 0.9:
+            return 0.05
+        elif max_util < 0.95:
+            return 0.15
+        else:
+            return 0.30
+
+
+# =============================================================================
+# CLUSTER STATE SIMULATOR
+# =============================================================================
+
+@dataclass
+class SimulatedClusterState:
+    """Stato simulato di un cluster durante un episodio."""
+    
+    name: str
+    cluster_type: str
+    cpu_capacity: int
+    memory_capacity: int
+    cpu_used: int
+    memory_used: int
+    placements_count: int
+    latency_to_cloud: float
+    
+    @property
+    def cpu_available(self) -> int:
+        return max(0, self.cpu_capacity - self.cpu_used)
+    
+    @property
+    def memory_available(self) -> int:
+        return max(0, self.memory_capacity - self.memory_used)
+    
+    @property
+    def cpu_utilization(self) -> float:
+        return self.cpu_used / self.cpu_capacity if self.cpu_capacity > 0 else 0.0
+    
+    @property
+    def memory_utilization(self) -> float:
+        return self.memory_used / self.memory_capacity if self.memory_capacity > 0 else 0.0
+    
+    def can_fit(self, cpu_required: int, memory_required: int) -> bool:
+        """Verifica se la pipeline può essere ospitata."""
+        return (self.cpu_available >= cpu_required and 
+                self.memory_available >= memory_required)
+    
+    def allocate(self, cpu: int, memory: int) -> bool:
+        """
+        Alloca risorse per una pipeline.
+        
+        Returns:
+            True se allocazione riuscita, False altrimenti
+        """
+        if not self.can_fit(cpu, memory):
+            return False
+        
+        self.cpu_used += cpu
+        self.memory_used += memory
+        self.placements_count += 1
+        return True
+    
+    def release(self, cpu: int, memory: int):
+        """Rilascia risorse (quando pipeline termina)."""
+        self.cpu_used = max(0, self.cpu_used - cpu)
+        self.memory_used = max(0, self.memory_used - memory)
+        self.placements_count = max(0, self.placements_count - 1)
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def estimate_optimal_cluster(
+    pipeline_cpu: int,
+    pipeline_memory: int,
+    data_location: str,
+    clusters_state: Dict[str, SimulatedClusterState],
+    network_model: NetworkLatencyModel,
+    exec_simulator: ExecutionTimeSimulator
+) -> Tuple[str, float]:
+    """
+    Stima il cluster ottimale per una pipeline (ground truth per evaluation).
+    
+    Considera:
+    - Tempo di esecuzione stimato
+    - Data locality
+    - Contesa risorse
+    
+    Returns:
+        (cluster_name, estimated_exec_time)
+    """
+    best_cluster = None
+    best_time = float('inf')
+    
+    for name, state in clusters_state.items():
+        # Verifica se la pipeline ci entra
+        if not state.can_fit(pipeline_cpu, pipeline_memory):
+            continue
+        
+        # Calcola tempo stimato
+        is_local = (data_location == name or data_location == "none")
+        latency = network_model.get_latency(data_location, name) if not is_local else 0.0
+        
+        exec_time = exec_simulator.simulate(
+            pipeline_cpu=pipeline_cpu,
+            pipeline_memory=pipeline_memory,
+            cluster_cpu_utilization=state.cpu_utilization,
+            cluster_memory_utilization=state.memory_utilization,
+            network_latency_ms=latency,
+            is_data_local=is_local
         )
-        new_mem_used = np.clip(
-            cluster['memory_used'] + mem_variation,
-            0,
-            cluster['memory_capacity']
-        )
         
-        # Update available
-        cluster['cpu_used'] = new_cpu_used
-        cluster['memory_used'] = new_mem_used
-        cluster['cpu_available'] = cluster['cpu_capacity'] - new_cpu_used
-        cluster['memory_available'] = cluster['memory_capacity'] - new_mem_used
-        
-        return cluster
+        if exec_time < best_time:
+            best_time = exec_time
+            best_cluster = name
+    
+    return best_cluster, best_time
 
 
-# ========== UTILITIES ==========
+# =============================================================================
+# TESTING
+# =============================================================================
 
-def format_bytes(bytes_val: int) -> str:
-    """Format bytes in human-readable form"""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_val < 1024.0:
-            return f"{bytes_val:.2f} {unit}"
-        bytes_val /= 1024.0
-    return f"{bytes_val:.2f} PB"
-
-
-def format_millicores(millicores: int) -> str:
-    """Format millicores in cores"""
-    cores = millicores / 1000.0
-    return f"{cores:.2f} cores ({millicores}m)"
-
-
-# ========== TESTING ==========
 if __name__ == "__main__":
-    print("=" * 60)
-    print("SIMULATOR TESTING")
-    print("=" * 60)
-    
-    # Test Execution Time Simulator
-    print("\n1. Execution Time Simulator:")
-    exec_sim = ExecutionTimeSimulator()
-    
-    scenarios = [
-        {
-            "name": "Light pipeline, ample resources, data local",
-            "pipeline_cpu": 500,
-            "pipeline_memory": 1 * 1024**3,
-            "cluster_cpu_available": 5000,
-            "cluster_memory_available": 10 * 1024**3,
-            "network_latency": 0,
-            "is_data_local": True
-        },
-        {
-            "name": "Heavy pipeline, scarce CPU, data remote",
-            "pipeline_cpu": 3000,
-            "pipeline_memory": 6 * 1024**3,
-            "cluster_cpu_available": 4000,
-            "cluster_memory_available": 8 * 1024**3,
-            "network_latency": 45,
-            "is_data_local": False
-        },
-    ]
-    
-    for scenario in scenarios:
-        exec_time = exec_sim.simulate(**{k: v for k, v in scenario.items() if k != 'name'})
-        print(f"\n  {scenario['name']}:")
-        print(f"    Execution time: {exec_time:.2f}s")
+    print("=" * 70)
+    print("CloudContinuum RL - Simulator Test")
+    print("=" * 70)
     
     # Test Network Latency Model
-    print("\n2. Network Latency Model:")
-    latency_model = NetworkLatencyModel()
+    print("\n📡 Network Latency Model:")
+    print("-" * 70)
     
-    cluster_pairs = [
+    from config import DEFAULT_CLUSTERS
+    
+    network = NetworkLatencyModel(DEFAULT_CLUSTERS)
+    
+    pairs = [
+        ("cloud_cluster", "cloud_cluster"),
         ("cloud_cluster", "edge_cluster_1"),
+        ("edge_cluster_1", "cloud_cluster"),
         ("edge_cluster_1", "edge_cluster_2"),
-        ("edge_cluster_2", "edge_cluster_3"),
     ]
     
-    for source, target in cluster_pairs:
-        latency = latency_model.get_latency(source, target)
-        bandwidth = latency_model.get_bandwidth_estimate(source, target)
-        print(f"\n  {source} → {target}:")
-        print(f"    Latency: {latency:.2f}ms")
-        print(f"    Bandwidth: {bandwidth:.0f} Mbps")
+    for src, dst in pairs:
+        latency = network.get_latency(src, dst)
+        print(f"  {src} → {dst}: {latency}ms")
     
-    print("\n" + "=" * 60)
+    # Test Execution Time Simulator
+    print("\n⏱️  Execution Time Simulator:")
+    print("-" * 70)
+    
+    simulator = ExecutionTimeSimulator()
+    
+    test_cases = [
+        {"cpu": 500, "util": 0.3, "local": True, "desc": "Small pipeline, light cluster, local"},
+        {"cpu": 500, "util": 0.3, "local": False, "desc": "Small pipeline, light cluster, remote"},
+        {"cpu": 2000, "util": 0.3, "local": True, "desc": "Large pipeline, light cluster, local"},
+        {"cpu": 500, "util": 0.8, "local": True, "desc": "Small pipeline, busy cluster, local"},
+        {"cpu": 2000, "util": 0.8, "local": False, "desc": "Large pipeline, busy cluster, remote"},
+    ]
+    
+    for tc in test_cases:
+        time = simulator.simulate(
+            pipeline_cpu=tc["cpu"],
+            pipeline_memory=1024*1024*1024,  # 1GB
+            cluster_cpu_utilization=tc["util"],
+            cluster_memory_utilization=tc["util"],
+            network_latency_ms=0 if tc["local"] else 20,
+            is_data_local=tc["local"]
+        )
+        normalized = simulator.normalize_time(time)
+        print(f"  {tc['desc']}")
+        print(f"    → {time:.1f}s (normalized: {normalized:.2f})")
+    
+    # Test Contention Model
+    print("\n🔥 Resource Contention Model:")
+    print("-" * 70)
+    
+    for util in [0.3, 0.5, 0.7, 0.85, 0.95]:
+        score = ResourceContentionModel.get_contention_score(util, util)
+        fail_prob = ResourceContentionModel.get_failure_probability(util, util, 0.2, 0.2)
+        print(f"  Utilization {util*100:.0f}%: contention={score:.2f}, fail_prob={fail_prob*100:.0f}%")
+    
+    print("\n" + "=" * 70)
+    print("✅ Simulator OK!")
+    print("=" * 70)

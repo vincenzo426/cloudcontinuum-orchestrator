@@ -1,252 +1,490 @@
 # internal/rl/config.py
 """
-Configurazione centralizzata per RL-based pipeline placement
-VERSIONE 2.2 - FIX CLOUD BIAS & BALANCED REWARDS
+CloudContinuum RL - Configuration Module
+VERSIONE 4.0 - ANTI-MYOPIC ARCHITECTURE
 
-CHANGELOG v2.2:
-- Fix reward imbalance: penalty_remote_placement aumentato -20 → -180
-- Aggiunti penalty_edge_imbalance e bonus_cloud_usage
-- Target utilization range ristretto per forzare bilanciamento
-- Baseline cluster bilanciato (cloud meno carico iniziale)
+Architettura ottimizzata per:
+1. Minimizzare tempo di esecuzione
+2. Evitare scelte miopi (non sprecare cloud con pipeline piccole)
+3. Bilanciamento carico tra cluster
+4. Data locality come fattore secondario (impatta il tempo)
+
+State Space: 28 features
+Reward: Orientato al tempo + penalità strategiche
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import List, Dict, Optional, Tuple
+
+
+# =============================================================================
+# CLUSTER CONFIGURATION
+# =============================================================================
 
 @dataclass
 class ClusterConfig:
-    """Configurazione capacità cluster (da ambiente reale)"""
-    name: str
-    cpu_capacity: int      # millicores
-    memory_capacity: int   # bytes
-    cluster_type: str      # "cloud" o "edge"
+    """Configurazione singolo cluster Kubernetes."""
     
-    # Utilizzo corrente (ex baseline)
-    cpu_used: int = 0
-    memory_used: int = 0
+    name: str
+    cpu_capacity: int          # millicores
+    memory_capacity: int       # bytes
+    cluster_type: str          # "cloud" o "edge"
+    
+    # Baseline: risorse GIÀ RICHIESTE da workload esistenti
+    baseline_cpu_requested: int = 0
+    baseline_memory_requested: int = 0
+    
+    # Network latency verso cloud (ms)
+    latency_to_cloud: float = 0.0
+    
+    def __post_init__(self):
+        if self.cluster_type not in ("cloud", "edge"):
+            raise ValueError(f"cluster_type must be 'cloud' or 'edge', got {self.cluster_type}")
+    
+    @property
+    def cpu_available(self) -> int:
+        return max(0, self.cpu_capacity - self.baseline_cpu_requested)
+    
+    @property
+    def memory_available(self) -> int:
+        return max(0, self.memory_capacity - self.baseline_memory_requested)
+    
+    @property
+    def cpu_utilization(self) -> float:
+        return self.baseline_cpu_requested / self.cpu_capacity if self.cpu_capacity > 0 else 0.0
+    
+    @property
+    def memory_utilization(self) -> float:
+        return self.baseline_memory_requested / self.memory_capacity if self.memory_capacity > 0 else 0.0
+
 
 # =============================================================================
-# DEFAULT_CLUSTERS - BILANCIATO v2.2
+# DEFAULT CLUSTERS - Valori REALI dal tuo ambiente
 # =============================================================================
-DEFAULT_CLUSTERS = [
+
+DEFAULT_CLUSTERS: List[ClusterConfig] = [
     ClusterConfig(
         name="cloud_cluster",
-        cpu_capacity=8000,            # 8 cores
-        memory_capacity=16739684352,  # ~16GB
+        cpu_capacity=8000,
+        memory_capacity=16739680256,          # ~15.59 GB
         cluster_type="cloud",
-        cpu_used=400,                 # ⚠️ RIDOTTO da 700 → 5% utilizzato (più attraente)
-        memory_used=805306368         # ~750MB
+        baseline_cpu_requested=4905,          # ~61%
+        baseline_memory_requested=11001659392, # ~65%
+        latency_to_cloud=0.0,
     ),
     ClusterConfig(
         name="edge_cluster_1",
-        cpu_capacity=6000,            # 6 cores
-        memory_capacity=16739696640,  # ~16GB
+        cpu_capacity=6000,
+        memory_capacity=16739696640,
         cluster_type="edge",
-        cpu_used=450,                 # 7.5% utilizzato
-        memory_used=1073741824        # ~1GB
+        baseline_cpu_requested=3605,          # ~60%
+        baseline_memory_requested=8912896000, # ~53%
+        latency_to_cloud=15.0,
     ),
     ClusterConfig(
         name="edge_cluster_2",
-        cpu_capacity=6000,            # 6 cores
-        memory_capacity=16739692544,  # ~16GB
+        cpu_capacity=6000,
+        memory_capacity=16739692544,
         cluster_type="edge",
-        cpu_used=450,                 # 7.5% utilizzato
-        memory_used=1073741824        # ~1GB
+        baseline_cpu_requested=3605,
+        baseline_memory_requested=8912896000,
+        latency_to_cloud=20.0,
     ),
     ClusterConfig(
         name="edge_cluster_3",
-        cpu_capacity=6000,            # 6 cores
-        memory_capacity=16739700736,  # ~16GB
+        cpu_capacity=6000,
+        memory_capacity=16739700736,
         cluster_type="edge",
-        cpu_used=450,                 # 7.5% utilizzato
-        memory_used=1073741824        # ~1GB
+        baseline_cpu_requested=3605,
+        baseline_memory_requested=8912896000,
+        latency_to_cloud=25.0,
     ),
 ]
 
+
+# =============================================================================
+# PIPELINE TEMPLATES - Calibrate per spazio disponibile reale
+# =============================================================================
+
+# Spazio disponibile:
+# - Cloud: ~3095m CPU, ~5.3GB RAM
+# - Edge:  ~2395m CPU, ~7.3GB RAM
+
+PIPELINE_TEMPLATES: List[Dict] = [
+    # SMALL - Entrano su tutti gli edge
+    {
+        "name": "data_preprocessing",
+        "cpu_range": (200, 600),
+        "memory_range": (256 * 1024 * 1024, 768 * 1024 * 1024),
+        "weight": 0.30,
+        "expected_size": "small",
+    },
+    {
+        "name": "feature_extraction",
+        "cpu_range": (400, 900),
+        "memory_range": (512 * 1024 * 1024, 1024 * 1024 * 1024),
+        "weight": 0.25,
+        "expected_size": "small",
+    },
+    
+    # MEDIUM - Entrano su alcuni edge
+    {
+        "name": "model_inference",
+        "cpu_range": (800, 1500),
+        "memory_range": (1 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
+        "weight": 0.25,
+        "expected_size": "medium",
+    },
+    
+    # LARGE - Potrebbero entrare SOLO su cloud
+    {
+        "name": "model_training",
+        "cpu_range": (1500, 2500),
+        "memory_range": (2 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
+        "weight": 0.15,
+        "expected_size": "large",
+    },
+    {
+        "name": "batch_processing",
+        "cpu_range": (2000, 3000),
+        "memory_range": (3 * 1024 * 1024 * 1024, 5 * 1024 * 1024 * 1024),
+        "weight": 0.05,
+        "expected_size": "large",
+    },
+]
+
+
+# =============================================================================
+# PIPELINE SIZE CLASSIFICATION
+# =============================================================================
+
+class PipelineSizeCategory:
+    """
+    Classificazione dimensione pipeline per decisioni strategiche.
+    
+    IMPORTANTE: Usa soglie ASSOLUTE basate sulla dimensione della pipeline,
+    non su dove può entrare. Questo garantisce comportamento consistente
+    indipendentemente dallo stato dei cluster.
+    
+    Soglie basate sui PIPELINE_TEMPLATES:
+    - Small: < 1000m CPU (data_preprocessing, feature_extraction)
+    - Medium: 1000-2000m CPU (model_inference)
+    - Large: >= 2000m CPU (model_training, batch_processing)
+    """
+    SMALL = "small"    # Pipeline leggere, dovrebbero andare su edge
+    MEDIUM = "medium"  # Pipeline medie, preferibilmente edge se c'è spazio
+    LARGE = "large"    # Pipeline pesanti, richiedono cloud
+    
+    # Soglie assolute in millicores
+    THRESHOLD_SMALL = 1000   # < 1000m = small
+    THRESHOLD_LARGE = 2000   # >= 2000m = large, altrimenti medium
+    
+    @staticmethod
+    def classify(cpu_required: int, memory_required: int, 
+                 clusters: List[ClusterConfig] = None) -> Tuple[str, float]:
+        """
+        Classifica pipeline basandosi su SOGLIE ASSOLUTE di CPU.
+        
+        Args:
+            cpu_required: CPU richiesta in millicores
+            memory_required: Memoria richiesta (non usata per classificazione)
+            clusters: Lista cluster (non usata, mantenuta per compatibilità)
+        
+        Returns:
+            (category, numeric_value) dove numeric_value è 0.0/0.5/1.0
+        """
+        if cpu_required < PipelineSizeCategory.THRESHOLD_SMALL:
+            return PipelineSizeCategory.SMALL, 0.0
+        elif cpu_required >= PipelineSizeCategory.THRESHOLD_LARGE:
+            return PipelineSizeCategory.LARGE, 1.0
+        else:
+            return PipelineSizeCategory.MEDIUM, 0.5
+
+
+# =============================================================================
+# ENVIRONMENT CONFIGURATION
+# =============================================================================
+
 @dataclass
 class EnvironmentConfig:
-    """Configurazione Gymnasium Environment - BALANCED v2.2"""
+    """
+    Configurazione Gymnasium Environment.
     
-    # ========== CLUSTERS CONFIGURATION ==========
-    clusters: List[ClusterConfig] = None
+    VERSIONE 4.0 - Anti-Myopic Architecture
     
-    # ========== EPISODE PARAMETERS ==========
-    pipelines_per_episode: int = 8 
-    max_episode_steps: int = 100
+    STATE SPACE (28 features):
+    ─────────────────────────────────────────────────────────────────
+    Per cluster (5 features × 4 cluster = 20):
+        [0] cpu_available_ratio      - CPU libera (0-1)
+        [1] memory_available_ratio   - RAM libera (0-1)
+        [2] is_data_local           - Dati qui? (0/1)
+        [3] can_fit_pipeline        - Pipeline ci entra? (0/1)
+        [4] is_cloud                - È il cloud? (0/1)
     
-    # ========== STATE SPACE DIMENSIONS ==========
-    state_features_per_cluster: int = 9
-    state_features_global: int = 9  # ⚠️ AUMENTATO da 6 → 9 (+3 features balance)
-    state_features_temporal: int = 5
+    Pipeline features (4):
+        [20] pipeline_cpu_ratio      - Dimensione CPU normalizzata
+        [21] pipeline_memory_ratio   - Dimensione RAM normalizzata
+        [22] pipeline_size_category  - small=0, medium=0.5, large=1
+        [23] fits_on_any_edge       - Può stare su almeno 1 edge? (0/1)
     
-    # ========== REWARD SHAPING V4.0 - BALANCED & CLOUD-FRIENDLY ==========
-    reward_scale: float = 1.0
+    Global features (4):
+        [24] cloud_cpu_headroom     - Spazio strategico cloud (0-1)
+        [25] avg_edge_utilization   - Media utilizzo edge (0-1)
+        [26] utilization_variance   - Sbilanciamento cluster (0-1)
+        [27] pipelines_remaining    - Pipeline rimaste (0-1)
+    ─────────────────────────────────────────────────────────────────
+    """
     
-    # Penalità
-    penalty_failed_placement: float = -500.0
-    penalty_invalid_action: float = -300.0
-    penalty_overload: float = -50.0
-    penalty_underutilization: float = -20.0
+    # ==================== CLUSTERS ====================
+    clusters: List[ClusterConfig] = field(default_factory=lambda: DEFAULT_CLUSTERS.copy())
     
-    # ⚠️ FIX CRITICO #1: Monopoly più severa
-    penalty_cluster_monopoly: float = -200.0  # Era -100
+    # ==================== EPISODE PARAMETERS ====================
+    pipelines_per_episode: int = 8
+    max_episode_steps: int = 50
     
-    # ⚠️ FIX CRITICO #2: Remote placement MOLTO più costoso
-    penalty_remote_placement: float = -180.0  # Era -20 → Ora -180
+    # ==================== CURRICULUM PARAMETERS ====================
+    baseline_load_variation: float = 0.0
+    data_locality_probability: float = 0.5
+    pipeline_size_multiplier: float = 1.0
     
-    # ⚠️ FIX CRITICO #3: Penalità per squilibrio edge clusters
-    penalty_edge_imbalance: float = -120.0  # NUOVO
+    # ==================== STATE SPACE ====================
+    features_per_cluster: int = 5
+    features_pipeline: int = 4
+    features_global: int = 4
     
-    # Reward e Bonus
-    bonus_successful_placement: float = 100.0
-    bonus_data_locality: float = 200.0
-    bonus_balanced_utilization: float = 150.0
-    bonus_new_cluster: float = 30.0
-    bonus_new_cluster_usage: float = 50.0
+    # ==================== REWARD SHAPING (Anti-Myopic) ====================
     
-    # ⚠️ FIX CRITICO #4: Bonus per uso cloud (compensa costi percepiti)
-    bonus_cloud_usage: float = 80.0  # NUOVO
+    # --- Fallimenti ---
+    reward_invalid_action: float = -1.0
+    reward_placement_failed: float = -0.8
     
-    bonus_perfect_episode: float = 500.0
+    # --- Tempo di Esecuzione (Obiettivo Primario) ---
+    # reward = reward_time_weight * (2.0 - normalized_exec_time)
+    # Se exec_time = baseline → reward = 0.3 * (2.0 - 1.0) = 0.3
+    # Se exec_time = 0.5*baseline → reward = 0.3 * (2.0 - 0.5) = 0.45
+    # Se exec_time = 1.5*baseline → reward = 0.3 * (2.0 - 1.5) = 0.15
+    reward_time_weight: float = 0.3
     
-    # ⚠️ FIX CRITICO #5: Range utilization ristretto per forzare bilanciamento
-    target_utilization_min: float = 0.45  # Era 0.30 → Più stretto
-    target_utilization_max: float = 0.85  # Era 0.95 → Più stretto
-    target_utilization_ideal: float = 0.70
+    # --- Data Locality (Impatta tempo, reward secondario) ---
+    reward_data_locality: float = 0.2
+    penalty_remote_placement: float = -0.1
     
-    # ========== SIMULATION PARAMETERS ==========
-    simulation_speedup: float = 1000.0
+    # --- Strategic Placement (Anti-Miopatia) ---
+    # PESI MOLTO FORTI: devono DOMINARE tutti gli altri reward!
+    # Penalità per pipeline PICCOLE su CLOUD (spreco risorse strategiche)
+    penalty_small_on_cloud: float = -0.8     # Era -0.5, ancora più forte!
+    # Bonus per pipeline GRANDI su CLOUD (uso appropriato)
+    bonus_large_on_cloud: float = 0.5        # Era 0.35, aumentato!
+    # Bonus per pipeline PICCOLE su EDGE (scelta corretta)
+    bonus_small_on_edge: float = 0.3         # Era 0.2, aumentato
+    # Bonus per pipeline MEDIE su EDGE (anche loro dovrebbero andare su edge se possibile)
+    bonus_medium_on_edge: float = 0.15       # NUOVO!
+    
+    # --- Bilanciamento ---
+    reward_balanced_utilization: float = 0.1
+    penalty_near_saturation: float = -0.15
+    
+    # --- Fine Episodio ---
+    reward_perfect_episode: float = 0.3
+    penalty_per_failure: float = -0.1
+    
+    # ==================== UTILIZATION THRESHOLDS ====================
+    utilization_optimal_min: float = 0.5
+    utilization_optimal_max: float = 0.8
+    utilization_danger: float = 0.9
+    
+    # ==================== EXECUTION TIME SIMULATION ====================
+    # Tempo base: ~30 secondi per CPU core richiesto
+    exec_time_per_cpu_core: float = 30.0
+    # Fattore latenza: quanto la latency di rete impatta il tempo
+    latency_impact_factor: float = 0.5
+    # Fattore contesa: quanto un cluster carico rallenta l'esecuzione
+    contention_impact_factor: float = 0.5
+    
+    # ==================== POISSON PROCESS (Arrivo Pipeline) ====================
+    # Tempo medio tra arrivi di pipeline (secondi) - distribuzione esponenziale
+    # Valore basso = burst frequenti, valore alto = arrivi diluiti
+    avg_inter_arrival_time: float = 45.0
+    
+    # ==================== RESOURCE RELEASE (Rilascio Risorse) ====================
+    # Le pipeline terminano e rilasciano risorse dopo exec_time
+    enable_resource_release: bool = True
+    
+    # ==================== CONTENTION MODEL (Probabilità Fallimento) ====================
+    # Soglia di utilizzo oltre la quale il modello di contesa viene attivato
+    contention_activation_threshold: float = 0.85
+    # Se True, un cluster molto carico può far fallire il placement stocasticamente
+    enable_stochastic_failure: bool = True
+    
+    # ==================== BASELINE (Reference) ====================
+    # Tempo di esecuzione baseline per reference (non usato nel reward, usa ideal_time)
     baseline_execution_time: float = 60.0
     
-    # Network latency weights (per simulatore)
-    cpu_weight: float = 0.7
-    memory_weight: float = 0.2
-    latency_weight: float = 0.1
-    
-    # ========== DIFFICULTY CURRICULUM ==========
-    difficulty: str = "medium"  # easy/medium/hard
-    
-    # Parametri variabili per difficulty
-    difficulty_params: Dict[str, Dict] = field(default_factory=lambda: {
-        "easy": {
-            "pipelines_per_episode": 6,
-            "resource_variance": 0.1,
-            "failure_tolerance": 0.3,
-        },
-        "medium": {
-            "pipelines_per_episode": 10,
-            "resource_variance": 0.25,
-            "failure_tolerance": 0.15,
-        },
-        "hard": {
-            "pipelines_per_episode": 16,  
-            "resource_variance": 0.45,
-            "failure_tolerance": 0.05,
-            "data_locality_probability": 0.2
-        }
-    })
-    
-    # ========== SEED MANAGEMENT ==========
+    # ==================== RANDOM SEED ====================
     master_seed: int = 42
     
-    # ========== ACTION MASKING ==========
-    enable_action_masking: bool = True
-    
-    # ========== LOGGING & MONITORING ==========
-    verbose: bool = True
-    log_episode_stats: bool = True
-    
-    def __post_init__(self):
-        if self.clusters is None:
-            self.clusters = DEFAULT_CLUSTERS
-        
-        # Applica parametri specifici per difficulty
-        if self.difficulty in self.difficulty_params:
-            params = self.difficulty_params[self.difficulty]
-            self.pipelines_per_episode = params["pipelines_per_episode"]
-    
+    # ==================== COMPUTED PROPERTIES ====================
     @property
     def num_clusters(self) -> int:
         return len(self.clusters)
     
     @property
     def total_state_size(self) -> int:
-        """Dimensione totale del vettore stato"""
-        return (
-            self.num_clusters * self.state_features_per_cluster +
-            self.state_features_global +
-            self.state_features_temporal
+        return (self.features_per_cluster * self.num_clusters) + \
+               self.features_pipeline + self.features_global
+    
+    @property
+    def cluster_names(self) -> List[str]:
+        return [c.name for c in self.clusters]
+    
+    @property
+    def cloud_cluster(self) -> Optional[ClusterConfig]:
+        for c in self.clusters:
+            if c.cluster_type == "cloud":
+                return c
+        return None
+    
+    @property
+    def edge_clusters(self) -> List[ClusterConfig]:
+        return [c for c in self.clusters if c.cluster_type == "edge"]
+    
+    @property
+    def max_cpu_available(self) -> int:
+        return max(c.cpu_available for c in self.clusters)
+    
+    @property
+    def max_memory_available(self) -> int:
+        return max(c.memory_available for c in self.clusters)
+
+
+# =============================================================================
+# CURRICULUM LEARNING
+# =============================================================================
+
+def get_config_for_difficulty(difficulty: str) -> EnvironmentConfig:
+    """
+    Ritorna configurazione per livello di difficoltà.
+    
+    CURRICULUM REALISTICO - Ogni stage cambia l'ambiente in modo significativo:
+    
+    EASY:
+        - 4 pipeline per episodio
+        - Cluster con 30% meno carico (più spazio)
+        - Data locality sempre chiara (100%)
+        - Pipeline piccole (×0.7)
+        - Arrivi LENTI (60s) → più tempo per liberare risorse
+        → L'agente impara le basi: action masking, data locality
+    
+    MEDIUM:
+        - 8 pipeline per episodio
+        - Carico reale dei cluster
+        - Data locality 50%
+        - Pipeline normali
+        - Arrivi MEDI (45s) → equilibrio realistico
+        → L'agente impara: bilanciamento, quando usare cloud vs edge
+    
+    HARD:
+        - 12 pipeline per episodio
+        - Cluster con 15% più carico (meno spazio)
+        - Data locality rara (20%)
+        - Pipeline grandi (×1.2)
+        - Arrivi VELOCI (30s) → burst frequenti, stress test
+        → L'agente impara: decisioni strategiche anti-miopatia
+    """
+    
+    if difficulty == "easy":
+        return EnvironmentConfig(
+            pipelines_per_episode=4,
+            max_episode_steps=25,
+            baseline_load_variation=-0.3,
+            data_locality_probability=1.0,
+            pipeline_size_multiplier=0.7,
+            avg_inter_arrival_time=60.0,  # Arrivi lenti → ambiente rilassato
         )
     
-    def get_reward_config(self) -> Dict[str, float]:
-        """Ritorna dizionario con tutti i parametri reward (per logging)"""
-        return {
-            "penalty_failed_placement": self.penalty_failed_placement,
-            "penalty_invalid_action": self.penalty_invalid_action,
-            "penalty_overload": self.penalty_overload,
-            "penalty_underutilization": self.penalty_underutilization,
-            "penalty_cluster_monopoly": self.penalty_cluster_monopoly,
-            "penalty_remote_placement": self.penalty_remote_placement,
-            "penalty_edge_imbalance": self.penalty_edge_imbalance,
-            "bonus_successful_placement": self.bonus_successful_placement,
-            "bonus_data_locality": self.bonus_data_locality,
-            "bonus_balanced_utilization": self.bonus_balanced_utilization,
-            "bonus_new_cluster": self.bonus_new_cluster,
-            "bonus_cloud_usage": self.bonus_cloud_usage,
-        }
+    elif difficulty == "medium":
+        return EnvironmentConfig(
+            pipelines_per_episode=8,
+            max_episode_steps=50,
+            baseline_load_variation=0.0,
+            data_locality_probability=0.5,
+            pipeline_size_multiplier=1.0,
+            avg_inter_arrival_time=45.0,  # Equilibrio realistico
+        )
+    
+    elif difficulty == "hard":
+        # BILANCIATO: difficile ma non impossibile
+        # Con questi valori:
+        # - Cloud: 4905 + (4905 × 0.05) = 5150m usati → 2850m disponibili
+        # - Edge: 3605 + (3605 × 0.05) = 3785m usati → 2215m disponibili
+        # - Pipeline large max: 2500 × 1.0 = 2500m → ENTRA su cloud!
+        return EnvironmentConfig(
+            pipelines_per_episode=12,
+            max_episode_steps=75,
+            baseline_load_variation=0.05,    # Era 0.15, ridotto! Cluster con solo 5% più carico
+            data_locality_probability=0.2,
+            pipeline_size_multiplier=1.0,    # Era 1.1, ora normale (no scaling)
+            avg_inter_arrival_time=30.0,     # Burst frequenti → stress test
+        )
+    
+    else:
+        raise ValueError(f"Unknown difficulty: {difficulty}")
 
-    def get_difficulty_params(self) -> Dict:
-        """Helper per recuperare i parametri della difficulty corrente"""
-        return self.difficulty_params.get(self.difficulty, self.difficulty_params["medium"])
 
-# ========== PIPELINE WORKLOAD TEMPLATES ==========
-PIPELINE_TEMPLATES = {
-    "light": {
-        "cpu_range": (200, 600),
-        "memory_range": (0.5, 2),
-        "probability": 0.4,
-        "description": "2-6 executors, preprocessing/inference leggero"
-    },
-    "medium": {
-        "cpu_range": (600, 1200),
-        "memory_range": (2, 5),
-        "probability": 0.4,
-        "description": "6-12 executors, training moderato"
-    },
-    "heavy": {
-        "cpu_range": (1500, 2500),
-        "memory_range": (5, 8),
-        "probability": 0.2,
-        "description": "12-20 executors, training intensivo"
-    },
-}
+# =============================================================================
+# DEFAULT CONFIG
+# =============================================================================
 
-# ========== INSTANCE GLOBALE ==========
 DEFAULT_CONFIG = EnvironmentConfig()
 
-# ========== UTILITIES ==========
-def get_config_for_difficulty(difficulty: str) -> EnvironmentConfig:
-    """Factory per creare config basata su difficulty"""
-    config = EnvironmentConfig()
-    config.difficulty = difficulty
-    return config
 
-def print_config_summary(config: EnvironmentConfig):
-    """Stampa riepilogo configurazione (utile per debugging)"""
-    print("=" * 60)
-    print("ENVIRONMENT CONFIGURATION SUMMARY")
-    print("=" * 60)
-    print(f"Difficulty: {config.difficulty}")
-    print(f"Clusters: {config.num_clusters}")
-    print(f"Pipelines per episode: {config.pipelines_per_episode}")
-    print(f"State size: {config.total_state_size}")
-    print(f"Action masking: {config.enable_action_masking}")
-    print("\nReward Configuration:")
-    for key, value in config.get_reward_config().items():
-        print(f"  {key:30s}: {value:8.1f}")
-    print("=" * 60)
+# =============================================================================
+# TESTING
+# =============================================================================
 
 if __name__ == "__main__":
-    # Test configuration
+    print("=" * 70)
+    print("CloudContinuum RL - Config v4.0 (Anti-Myopic Architecture)")
+    print("=" * 70)
+    
     config = DEFAULT_CONFIG
-    print_config_summary(config)
+    
+    print(f"\n📊 Clusters ({config.num_clusters}):")
+    print("-" * 70)
+    for c in config.clusters:
+        print(f"  {c.name} [{c.cluster_type}]:")
+        print(f"    CPU:  {c.cpu_available}m / {c.cpu_capacity}m available "
+              f"({c.cpu_utilization*100:.1f}% used)")
+        print(f"    MEM:  {c.memory_available/(1024**3):.2f}GB / "
+              f"{c.memory_capacity/(1024**3):.2f}GB available")
+        print(f"    Latency to cloud: {c.latency_to_cloud}ms")
+    
+    print(f"\n📐 State Space: {config.total_state_size} features")
+    print(f"    Per cluster: {config.features_per_cluster} × {config.num_clusters} = "
+          f"{config.features_per_cluster * config.num_clusters}")
+    print(f"    Pipeline: {config.features_pipeline}")
+    print(f"    Global: {config.features_global}")
+    
+    print(f"\n🎯 Reward Structure (Anti-Myopic):")
+    print(f"    Time weight:        {config.reward_time_weight}")
+    print(f"    Data locality:     +{config.reward_data_locality}")
+    print(f"    Small on cloud:     {config.penalty_small_on_cloud} (PENALTY)")
+    print(f"    Large on cloud:    +{config.bonus_large_on_cloud} (BONUS)")
+    print(f"    Small on edge:     +{config.bonus_small_on_edge} (BONUS)")
+    
+    print(f"\n📦 Pipeline Size Classification:")
+    for template in PIPELINE_TEMPLATES:
+        cpu_avg = sum(template["cpu_range"]) / 2
+        print(f"    {template['name']}: ~{cpu_avg:.0f}m CPU → {template['expected_size']}")
+    
+    print(f"\n📚 Curriculum Learning:")
+    for diff in ["easy", "medium", "hard"]:
+        cfg = get_config_for_difficulty(diff)
+        print(f"  {diff.upper():6s}: {cfg.pipelines_per_episode} pipelines, "
+              f"load {cfg.baseline_load_variation:+.0%}, "
+              f"locality {cfg.data_locality_probability:.0%}, "
+              f"arrivals ~{cfg.avg_inter_arrival_time:.0f}s")
+    
+    print("\n" + "=" * 70)
+    print("✅ Configuration OK!")
+    print("=" * 70)

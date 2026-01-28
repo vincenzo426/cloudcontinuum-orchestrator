@@ -57,20 +57,24 @@ func (s *RLPipelineStrategy) SelectCluster(
 		return "", "", fmt.Errorf("RL inference failed: %w", err)
 	}
 
-	// 3. Valida la risposta
+	// 3. Verifica che la risposta sia valida (NUOVO CHECK!)
+	if !response.IsValid {
+		return "", "", fmt.Errorf("RL model returned invalid prediction: %s", response.Reason)
+	}
+
+	// 4. Verifica che il cluster sia stato specificato
 	if response.TargetCluster == "" {
 		return "", "", fmt.Errorf("RL model returned empty cluster")
 	}
 
-	// 4. Verifica che il cluster sia valido
+	// 5. Verifica che il cluster esista nelle metriche
 	if _, exists := metrics.Clusters[response.TargetCluster]; !exists {
-		return "", "", fmt.Errorf("RL model returned invalid cluster: %s", response.TargetCluster)
+		return "", "", fmt.Errorf("RL model returned unknown cluster: %s", response.TargetCluster)
 	}
 
-	// 5. Usa la decisione motivata dal modello RL
+	// 6. Usa la decisione motivata dal modello RL
 	decision := response.Reason
 	if decision == "" {
-		// Fallback se reason non è presente
 		decision = s.buildDecisionRationale(response, pipeline, dataLocation)
 	}
 
@@ -78,37 +82,38 @@ func (s *RLPipelineStrategy) SelectCluster(
 }
 
 // ============================================================================
-// COSTRUZIONE RICHIESTA RL
+// STRUTTURE DATI JSON
 // ============================================================================
 
 // RLRequest rappresenta la richiesta JSON inviata al servizio RL.
-// Deve matchare esattamente il formato atteso da inference.py
 type RLRequest struct {
 	Pipeline map[string]interface{}  `json:"pipeline"`
 	Clusters map[string]ClusterState `json:"clusters"`
 }
 
 // ClusterState rappresenta lo stato di un singolo cluster.
-// Deve matchare esattamente il formato atteso da inference.py
 type ClusterState struct {
-	CPUCapacity     int64 `json:"cpu_capacity"`     // millicores
-	CPUAvailable    int64 `json:"cpu_available"`    // millicores
-	MemoryCapacity  int64 `json:"memory_capacity"`  // bytes
-	MemoryAvailable int64 `json:"memory_available"` // bytes
-	CPUUsed         int64 `json:"cpu_used"`         // millicores
-	MemoryUsed      int64 `json:"memory_used"`      // bytes
+	CPUCapacity     int64 `json:"cpu_capacity"`
+	CPUAvailable    int64 `json:"cpu_available"`
+	MemoryCapacity  int64 `json:"memory_capacity"`
+	MemoryAvailable int64 `json:"memory_available"`
+	CPUUsed         int64 `json:"cpu_used,omitempty"`
+	MemoryUsed      int64 `json:"memory_used,omitempty"`
 }
 
 // RLResponse rappresenta la risposta JSON del servizio RL.
-// Deve matchare esattamente il formato ritornato da inference.py
 type RLResponse struct {
 	TargetCluster       string             `json:"target_cluster"`
 	Confidence          float64            `json:"confidence"`
 	Reason              string             `json:"reason"`
+	IsValid             bool               `json:"is_valid"` // IMPORTANTE: gestisce casi di errore
 	ActionProbabilities map[string]float64 `json:"action_probabilities,omitempty"`
 }
 
-// buildRLRequest costruisce il payload JSON per il servizio RL.
+// ============================================================================
+// COSTRUZIONE RICHIESTA
+// ============================================================================
+
 func (s *RLPipelineStrategy) buildRLRequest(
 	pipeline *PipelineIR,
 	dataLocation string,
@@ -117,19 +122,18 @@ func (s *RLPipelineStrategy) buildRLRequest(
 
 	totalResources := CalculatePipelineResources(pipeline, s.parser)
 
-	// Pipeline requirements (MILLICORES e BYTES come atteso da Python)
+	// Pipeline requirements (millicores e bytes)
 	pipelineReq := map[string]interface{}{
-		"cpu_required":    totalResources.TotalCPU,    // millicores
-		"memory_required": totalResources.TotalMemory, // bytes
+		"cpu_required":    totalResources.TotalCPU,
+		"memory_required": totalResources.TotalMemory,
 		"data_location":   dataLocation,
-		"pipeline_name":   pipeline.PipelineInfo.Name,
 	}
 
-	// Clusters state (MILLICORES e BYTES)
+	// Clusters state
 	clustersState := make(map[string]ClusterState)
 	for clusterName, clusterMetric := range metrics.Clusters {
 		if !clusterMetric.Available {
-			continue // Salta cluster non disponibili
+			continue
 		}
 
 		clustersState[clusterName] = ClusterState{
@@ -137,8 +141,6 @@ func (s *RLPipelineStrategy) buildRLRequest(
 			CPUAvailable:    clusterMetric.CPUAvailable,
 			MemoryCapacity:  clusterMetric.MemoryCapacity,
 			MemoryAvailable: clusterMetric.MemoryAvailable,
-			CPUUsed:         clusterMetric.CPUUsed,
-			MemoryUsed:      clusterMetric.MemoryUsed,
 		}
 	}
 
@@ -149,18 +151,15 @@ func (s *RLPipelineStrategy) buildRLRequest(
 }
 
 // ============================================================================
-// CHIAMATA HTTP AL SERVIZIO RL
+// CHIAMATA HTTP
 // ============================================================================
 
-// callRLInference effettua la chiamata HTTP al servizio Flask.
 func (s *RLPipelineStrategy) callRLInference(ctx context.Context, payload RLRequest) (*RLResponse, error) {
-	// Serializza payload
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Crea richiesta HTTP
 	url := fmt.Sprintf("%s/predict", s.inferenceURL)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -169,25 +168,21 @@ func (s *RLPipelineStrategy) callRLInference(ctx context.Context, payload RLRequ
 
 	req.Header.Set("Content-Type", "application/json")
 
-	// Esegui richiesta
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Leggi body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Controlla status code
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("RL service returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Deserializza risposta
 	var rlResponse RLResponse
 	if err := json.Unmarshal(body, &rlResponse); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
@@ -200,8 +195,6 @@ func (s *RLPipelineStrategy) callRLInference(ctx context.Context, payload RLRequ
 // COSTRUZIONE DECISIONE (FALLBACK)
 // ============================================================================
 
-// buildDecisionRationale costruisce una spiegazione della decisione RL.
-// Usato solo come fallback se il servizio RL non ritorna 'reason'.
 func (s *RLPipelineStrategy) buildDecisionRationale(
 	response *RLResponse,
 	pipeline *PipelineIR,
@@ -210,34 +203,17 @@ func (s *RLPipelineStrategy) buildDecisionRationale(
 
 	totalResources := CalculatePipelineResources(pipeline, s.parser)
 
-	decision := fmt.Sprintf("RL-based placement: Selected cluster '%s' with confidence %.2f%%",
-		response.TargetCluster, response.Confidence*100)
-
-	// Aggiungi info su risorse (converti per leggibilità)
 	cpuCores := float64(totalResources.TotalCPU) / 1000.0
 	memoryGB := float64(totalResources.TotalMemory) / (1024 * 1024 * 1024)
 
-	decision += fmt.Sprintf("\nPipeline requirements: %.2f cores, %.2f GB memory",
-		cpuCores, memoryGB)
+	decision := fmt.Sprintf("RL placement: %s (conf: %.0f%%, cpu: %.2f cores, mem: %.2f GB)",
+		response.TargetCluster, response.Confidence*100, cpuCores, memoryGB)
 
-	if totalResources.TotalGPU > 0 {
-		decision += fmt.Sprintf(", %d GPU", totalResources.TotalGPU)
-	}
-
-	// Aggiungi info su data locality
-	if dataLocation != "" && dataLocation != "none" {
+	if dataLocation != "" && dataLocation != "none" && dataLocation != "distributed" {
 		if response.TargetCluster == dataLocation {
-			decision += fmt.Sprintf("\nData locality: Co-located with data at '%s'", dataLocation)
+			decision += " [data local]"
 		} else {
-			decision += fmt.Sprintf("\nData locality: Data at '%s', transfer required", dataLocation)
-		}
-	}
-
-	// Aggiungi probabilità azioni se disponibili
-	if len(response.ActionProbabilities) > 0 {
-		decision += "\nAction probabilities:"
-		for cluster, prob := range response.ActionProbabilities {
-			decision += fmt.Sprintf("\n  - %s: %.2f%%", cluster, prob*100)
+			decision += fmt.Sprintf(" [data at %s]", dataLocation)
 		}
 	}
 

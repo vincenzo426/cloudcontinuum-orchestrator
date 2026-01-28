@@ -1,728 +1,1039 @@
 # internal/rl/environment.py
 """
 CloudContinuum Gymnasium Environment
-VERSIONE 2.1 - BALANCED REWARDS & ENHANCED STATE
+VERSIONE 4.0 - ANTI-MYOPIC ARCHITECTURE
 
-CHANGELOG v2.1:
-- Reward calculation ribilanciato per evitare cloud bias
-- Aggiunta penalty per edge clusters imbalance
-- Aggiunto bonus cloud usage
-- Enhanced state features (+3 global: cloud/edge ratio, edge imbalance, transfer cost)
+Environment per training di agente RL che piazza pipeline ML su cluster distribuiti.
+
+OBIETTIVI (in ordine di priorità):
+1. Minimizzare tempo di esecuzione
+2. Evitare scelte miopi (non sprecare cloud con pipeline piccole)
+3. Bilanciare carico tra cluster
+4. Rispettare data locality quando possibile
+
+STATE SPACE: 28 features
+ACTION SPACE: Discrete(4) - scelta del cluster
+REWARD: Range ~[-1, +1], orientato al tempo con penalità strategiche
 """
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import random
+from copy import deepcopy
 
-from .config import EnvironmentConfig, DEFAULT_CONFIG, ClusterConfig, PIPELINE_TEMPLATES
-from .simulator import ExecutionTimeSimulator, NetworkLatencyModel
+from .config import (
+    EnvironmentConfig, 
+    DEFAULT_CONFIG, 
+    ClusterConfig,
+    PIPELINE_TEMPLATES,
+    PipelineSizeCategory,
+    get_config_for_difficulty
+)
+from .simulator import (
+    ExecutionTimeSimulator,
+    NetworkLatencyModel,
+    SimulatedClusterState,
+    ResourceContentionModel
+)
 
+
+# =============================================================================
+# GYMNASIUM ENVIRONMENT
+# =============================================================================
 
 class CloudContinuumEnv(gym.Env):
     """
-    Gymnasium Environment per placement di pipeline ML su cluster distribuiti.
+    Gymnasium Environment per placement intelligente di pipeline ML.
     
-    State Space: Vector di float con info su:
-        - Per-cluster features (9 per cluster)
-        - Global features (9 totali) ← AUMENTATO da 6
-        - Temporal features (5 totali)
+    L'agente deve imparare a:
+    - Piazzare pipeline dove il tempo di esecuzione è minimo
+    - NON sprecare il cloud con pipeline piccole (anti-miopatia)
+    - Bilanciare il carico tra i cluster
+    - Preferire data locality quando non compromette gli altri obiettivi
     
-    Action Space: Discrete(num_clusters) - selezione del cluster
-    
-    Reward v2.1:
-        - Successo: +100 base + bonus data locality/balance/cloud
-        - Fallimento: -500 (aggressivo)
-        - Invalid action: -300
-        - Remote placement: -180 (aumentato da -20)
+    Attributes:
+        config: Configurazione ambiente
+        action_space: Discrete(num_clusters)
+        observation_space: Box(28,) con features normalizzate
     """
     
-    metadata = {"render_modes": ["human"]}
+    metadata = {"render_modes": ["human", "ansi"]}
     
-    def __init__(self, config: EnvironmentConfig = None, seed: int = None):
+    def __init__(
+        self, 
+        config: EnvironmentConfig = None, 
+        seed: int = None,
+        render_mode: str = None
+    ):
+        """
+        Inizializza environment.
+        
+        Args:
+            config: Configurazione (default: DEFAULT_CONFIG)
+            seed: Random seed per riproducibilità
+            render_mode: "human" per output leggibile
+        """
         super().__init__()
         
         self.config = config or DEFAULT_CONFIG
+        self.render_mode = render_mode
+        
         if seed is not None:
             self.seed(seed)
         
-        # Initialize simulators
-        self.exec_time_sim = ExecutionTimeSimulator(
-            base_time=self.config.baseline_execution_time
+        # === SIMULATORS ===
+        self.exec_simulator = ExecutionTimeSimulator(
+            time_per_cpu_core=self.config.exec_time_per_cpu_core,
+            latency_impact_factor=self.config.latency_impact_factor,
+            contention_impact_factor=self.config.contention_impact_factor,
+            baseline_time=self.config.baseline_execution_time
         )
-        self.network_latency_model = NetworkLatencyModel()
+        self.network_model = NetworkLatencyModel(self.config.clusters)
         
-        # Define action and observation space
+        # === SPACES ===
         self.action_space = spaces.Discrete(self.config.num_clusters)
         
-        # State space: continuous features
+        # Observation: 28 features normalizzate in [-1, 1] o [0, 1]
         self.observation_space = spaces.Box(
-            low=-10.0,
-            high=10.0,
+            low=-1.0,
+            high=2.0,  # Alcune features possono superare 1.0
             shape=(self.config.total_state_size,),
             dtype=np.float32
         )
         
-        # Internal state
-        self.current_step = 0
-        self.current_pipeline_idx = 0
-        self.pipelines_queue = []
-        self.clusters_state = {}
-        self.episode_stats = {}
+        # === INTERNAL STATE ===
+        self.clusters_state: Dict[str, SimulatedClusterState] = {}
+        self.pipelines_queue: List[Dict] = []
+        self.current_pipeline_idx: int = 0
+        self.current_step: int = 0
+        self.episode_stats: Dict = {}
         
-        # Action mask (per MaskablePPO)
-        self._current_action_mask = None
+        # === TEMPORAL STATE (Poisson Process & Resource Release) ===
+        self.current_time: float = 0.0  # Tempo simulato corrente (secondi)
+        self.active_jobs: List[Dict] = []  # Job in esecuzione con finish_time
+        
+        # Current pipeline (per action masking)
+        self._current_pipeline: Optional[Dict] = None
+        self._current_action_mask: Optional[np.ndarray] = None
     
-    def seed(self, seed=None):
-        """Set random seed"""
+    def seed(self, seed: int = None):
+        """Imposta random seed."""
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
             self.config.master_seed = seed
+        return [seed]
     
-    def reset(self, seed=None, options=None):
-        """Reset environment per nuovo episodio"""
+    # =========================================================================
+    # RESET
+    # =========================================================================
+    
+    def reset(
+        self, 
+        seed: int = None, 
+        options: Dict = None
+    ) -> Tuple[np.ndarray, Dict]:
+        """
+        Reset environment per nuovo episodio.
+        
+        Returns:
+            (observation, info)
+        """
         super().reset(seed=seed)
         
+        if seed is not None:
+            self.seed(seed)
+        
+        # Reset counters
         self.current_step = 0
         self.current_pipeline_idx = 0
         
-        # Initialize clusters state from config
+        # Reset temporal state (Poisson process & resource release)
+        self.current_time = 0.0
+        self.active_jobs = []
+        
+        # Reset episode statistics PRIMA di generare pipeline queue
+        # (perché _generate_pipeline_queue usa episode_stats per contare le categorie)
+        self.episode_stats = {
+            'placements_successful': 0,
+            'placements_failed': 0,
+            'placements_failed_contention': 0,  # Fallimenti per contesa stocastica
+            'total_reward': 0.0,
+            'execution_times': [],
+            'ideal_execution_times': [],  # Per calcolo efficienza
+            'data_locality_hits': 0,
+            'small_on_cloud': 0,
+            'large_on_cloud': 0,
+            'cluster_placements': {c.name: 0 for c in self.config.clusters},
+            'resources_released': 0,  # Contatore job completati
+            # Diagnostica: traccia quante pipeline per categoria
+            'pipeline_categories': {'small': 0, 'medium': 0, 'large': 0},
+            'pipeline_categories_placed': {'small': 0, 'medium': 0, 'large': 0},
+        }
+        
+        # Initialize cluster states (con variazione da curriculum)
         self.clusters_state = self._initialize_clusters()
         
         # Generate pipeline queue per questo episodio
         self.pipelines_queue = self._generate_pipeline_queue()
         
-        # Initialize episode statistics
-        self.episode_stats = {
-            'placements_successful': 0,
-            'placements_failed': 0,
-            'total_reward': 0.0,
-            'execution_times': [],
-            'failure_reasons': [],
-            'cluster_placements_count': {c.name: 0 for c in self.config.clusters}
-        }
+        # Set current pipeline
+        if len(self.pipelines_queue) > 0:
+            self._current_pipeline = self.pipelines_queue[0]
+        else:
+            self._current_pipeline = None
         
-        # Get initial observation
+        # Build observation
         obs = self._get_observation()
         info = self._get_info()
         
         return obs, info
     
-    def _initialize_clusters(self) -> Dict:
+    def _initialize_clusters(self) -> Dict[str, SimulatedClusterState]:
         """
-        Inizializza stato cluster con baseline realistico.
+        Inizializza stato cluster con variazione da curriculum.
         
-        Returns:
-            Dict con stato di ogni cluster
+        baseline_load_variation:
+            -0.3 = cluster con 30% meno carico (più spazio)
+            0.0 = carico reale
+            +0.15 = cluster con 15% più carico (meno spazio)
         """
-        clusters = {}
+        states = {}
+        variation = self.config.baseline_load_variation
         
-        for cluster_config in self.config.clusters:
-            clusters[cluster_config.name] = {
-                'name': cluster_config.name,
-                'cpu_capacity': cluster_config.cpu_capacity,
-                'memory_capacity': cluster_config.memory_capacity,
-                'cpu_used': cluster_config.cpu_used,
-                'memory_used': cluster_config.memory_used,
-                'cpu_available': cluster_config.cpu_capacity - cluster_config.cpu_used,
-                'memory_available': cluster_config.memory_capacity - cluster_config.memory_used,
-                'placements_count': 0,  # Count placement in questo episodio
-                'cluster_type': cluster_config.cluster_type
-            }
+        for cluster in self.config.clusters:
+            # Applica variazione al baseline
+            cpu_variation = int(cluster.baseline_cpu_requested * variation)
+            mem_variation = int(cluster.baseline_memory_requested * variation)
+            
+            adjusted_cpu = max(0, cluster.baseline_cpu_requested + cpu_variation)
+            adjusted_mem = max(0, cluster.baseline_memory_requested + mem_variation)
+            
+            # Assicura che non superi la capacità
+            adjusted_cpu = min(adjusted_cpu, int(cluster.cpu_capacity * 0.95))
+            adjusted_mem = min(adjusted_mem, int(cluster.memory_capacity * 0.95))
+            
+            states[cluster.name] = SimulatedClusterState(
+                name=cluster.name,
+                cluster_type=cluster.cluster_type,
+                cpu_capacity=cluster.cpu_capacity,
+                memory_capacity=cluster.memory_capacity,
+                cpu_used=adjusted_cpu,
+                memory_used=adjusted_mem,
+                placements_count=0,
+                latency_to_cloud=cluster.latency_to_cloud
+            )
         
-        return clusters
+        return states
     
     def _generate_pipeline_queue(self) -> List[Dict]:
         """
-        Genera coda di pipeline per questo episodio.
+        Genera coda di pipeline per l'episodio.
         
-        Usa template realistici con distribuzione bilanciata.
+        Rispetta:
+        - pipeline_size_multiplier: scala dimensioni
+        - data_locality_probability: probabilità che dati siano su edge specifico
         """
-        num_pipelines = self.config.pipelines_per_episode
-        difficulty_params = self.config.get_difficulty_params()
+        queue = []
         
-        pipelines = []
+        # Calcola pesi cumulativi per selezione template
+        weights = [t['weight'] for t in PIPELINE_TEMPLATES]
+        cumulative_weights = np.cumsum(weights)
         
-        for i in range(num_pipelines):
-            # Seleziona template basato su probabilità
-            template_name = self._select_template_weighted()
-            template = PIPELINE_TEMPLATES[template_name]
+        # Edge clusters per data locality
+        edge_names = [c.name for c in self.config.clusters if c.cluster_type == "edge"]
+        all_cluster_names = [c.name for c in self.config.clusters]
+        
+        for i in range(self.config.pipelines_per_episode):
+            # Seleziona template
+            r = random.random() * cumulative_weights[-1]
+            template_idx = np.searchsorted(cumulative_weights, r)
+            template = PIPELINE_TEMPLATES[template_idx]
             
-            # Genera risorse richieste
+            # Genera dimensioni con multiplier
+            mult = self.config.pipeline_size_multiplier
             cpu_min, cpu_max = template['cpu_range']
             mem_min, mem_max = template['memory_range']
             
+            cpu = int(random.uniform(cpu_min * mult, cpu_max * mult))
+            memory = int(random.uniform(mem_min * mult, mem_max * mult))
+            
+            # Determina data location
+            if random.random() < self.config.data_locality_probability:
+                # Dati su un edge specifico
+                data_location = random.choice(edge_names) if edge_names else "cloud_cluster"
+            else:
+                # Dati distribuiti (random cluster o "distributed")
+                if random.random() < 0.3:
+                    data_location = "distributed"  # Nessuna locality chiara
+                else:
+                    data_location = random.choice(all_cluster_names)
+            
+            # Classifica dimensione pipeline
+            size_category, size_value = PipelineSizeCategory.classify(
+                cpu, memory, self.config.clusters
+            )
+            
             pipeline = {
                 'id': f"pipeline_{i}",
-                'cpu_required': random.randint(cpu_min, cpu_max),
-                'memory_required': random.randint(int(mem_min * 1e9), int(mem_max * 1e9)),
-                'template': template_name,
-                'data_location': self._assign_data_location(difficulty_params)
+                'name': f"{template['name']}_{i}",
+                'cpu_required': cpu,
+                'memory_required': memory,
+                'data_location': data_location,
+                'size_category': size_category,
+                'size_value': size_value,
+                'template': template['name'],
             }
             
-            pipelines.append(pipeline)
+            queue.append(pipeline)
         
-        return pipelines
+        # Conta le categorie generate (per diagnostica)
+        for p in queue:
+            cat = p['size_category']
+            if cat in self.episode_stats['pipeline_categories']:
+                self.episode_stats['pipeline_categories'][cat] += 1
+        
+        return queue
     
-    def _select_template_weighted(self) -> str:
-        """Seleziona template usando probabilità definite"""
-        rand = random.random()
-        cumulative = 0.0
-        
-        for template_name, template_config in PIPELINE_TEMPLATES.items():
-            cumulative += template_config['probability']
-            if rand <= cumulative:
-                return template_name
-        
-        return "medium"  # Fallback
-    
-    def _assign_data_location(self, difficulty_params: Dict) -> str:
-        """
-        Assegna data location basato su probabilità di locality.
-        
-        Higher difficulty = meno locality
-        """
-        locality_prob = difficulty_params.get('data_locality_probability', 0.5)
-        
-        if random.random() < locality_prob:
-            # Assegna località a un cluster edge (più realistico)
-            edge_clusters = [c.name for c in self.config.clusters if c.cluster_type == "edge"]
-            return random.choice(edge_clusters) if edge_clusters else "cloud_cluster"
-        else:
-            # Nessuna località specifica
-            return "none"
+    # =========================================================================
+    # STEP
+    # =========================================================================
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
-        Esegui azione di placement.
+        Esegue azione (placement su cluster).
+        
+        FLUSSO AGGIORNATO:
+        1. Simula passaggio tempo (Poisson process)
+        2. Rilascia risorse dei job completati
+        3. Verifica action mask
+        4. Verifica contesa stocastica (cluster molto carichi possono fallire)
+        5. Esegue placement se tutto ok
+        6. Calcola reward con normalizzazione dinamica
         
         Args:
-            action: Index del cluster dove fare placement
+            action: Index del cluster target
         
         Returns:
-            observation, reward, terminated, truncated, info
+            (observation, reward, terminated, truncated, info)
         """
         self.current_step += 1
         
-        # Get current pipeline
-        if self.current_pipeline_idx >= len(self.pipelines_queue):
-            # Episode completato
-            terminated = True
-            truncated = False
-            reward = self._calculate_episode_end_bonus()
+        # === 1. SIMULA PASSAGGIO TEMPO (Poisson Process) ===
+        time_elapsed = self._simulate_time_advance()
+        
+        # === 2. RILASCIA RISORSE DEI JOB COMPLETATI ===
+        self._update_active_jobs()
+        
+        # Check se episodio già terminato
+        if self._current_pipeline is None or self.current_pipeline_idx >= len(self.pipelines_queue):
             obs = self._get_observation()
             info = self._get_info()
-            return obs, reward, terminated, truncated, info
+            return obs, 0.0, True, False, info
         
-        pipeline = self.pipelines_queue[self.current_pipeline_idx]
+        pipeline = self._current_pipeline
         cluster_name = self.config.clusters[action].name
+        cluster_state = self.clusters_state[cluster_name]
         
-        # CRITICO: Verifica action masking
-        action_mask = self._get_valid_actions_mask(pipeline)
+        # === 3. VERIFICA ACTION MASK ===
+        action_mask = self.action_masks()
         if not action_mask[action]:
-            # INVALID ACTION - azione su cluster saturo
-            reward = self.config.penalty_invalid_action
+            # INVALID ACTION - cluster non può ospitare la pipeline
+            reward = self.config.reward_invalid_action
             self.episode_stats['placements_failed'] += 1
-            self.episode_stats['failure_reasons'].append('invalid_action')
+            self.episode_stats['total_reward'] += reward
             
-            # Move to next pipeline comunque
-            self.current_pipeline_idx += 1
+            # Avanza alla prossima pipeline
+            self._advance_to_next_pipeline()
             
             terminated = self.current_pipeline_idx >= len(self.pipelines_queue)
             truncated = self.current_step >= self.config.max_episode_steps
             
             obs = self._get_observation()
             info = self._get_info()
-            info['placement_failed'] = True
-            info['failure_reason'] = 'invalid_action'
+            info['placement_result'] = 'invalid_action'
+            info['time_elapsed'] = time_elapsed
             
             return obs, reward, terminated, truncated, info
         
-        # Tenta placement
-        placement_success, reward, failure_reason = self._try_place_pipeline(
-            pipeline, cluster_name
+        # === 4. VERIFICA CONTESA STOCASTICA ===
+        # Un cluster molto carico può far fallire il placement stocasticamente
+        if self.config.enable_stochastic_failure:
+            cpu_util = cluster_state.cpu_utilization
+            mem_util = cluster_state.memory_utilization
+            
+            if cpu_util > self.config.contention_activation_threshold or \
+               mem_util > self.config.contention_activation_threshold:
+                # Calcola probabilità di fallimento
+                failure_prob = ResourceContentionModel.get_failure_probability(
+                    cpu_utilization=cpu_util,
+                    memory_utilization=mem_util,
+                    pipeline_cpu_ratio=pipeline['cpu_required'] / cluster_state.cpu_capacity,
+                    pipeline_memory_ratio=pipeline['memory_required'] / cluster_state.memory_capacity
+                )
+                
+                # Lancia il dado
+                if np.random.random() < failure_prob:
+                    # FALLIMENTO STOCASTICO - contesa ha causato failure
+                    reward = self.config.reward_placement_failed
+                    self.episode_stats['placements_failed'] += 1
+                    self.episode_stats['placements_failed_contention'] += 1
+                    self.episode_stats['total_reward'] += reward
+                    
+                    self._advance_to_next_pipeline()
+                    
+                    terminated = self.current_pipeline_idx >= len(self.pipelines_queue)
+                    truncated = self.current_step >= self.config.max_episode_steps
+                    
+                    obs = self._get_observation()
+                    info = self._get_info()
+                    info['placement_result'] = 'contention_failure'
+                    info['failure_probability'] = failure_prob
+                    info['time_elapsed'] = time_elapsed
+                    
+                    return obs, reward, terminated, truncated, info
+        
+        # === 5. ESEGUI PLACEMENT ===
+        success = cluster_state.allocate(
+            pipeline['cpu_required'],
+            pipeline['memory_required']
         )
         
-        # Update stats
-        if placement_success:
-            self.episode_stats['placements_successful'] += 1
-            self.episode_stats['cluster_placements_count'][cluster_name] += 1
-        else:
+        if not success:
+            # Fallimento imprevisto (non dovrebbe accadere con action mask)
+            reward = self.config.reward_placement_failed
             self.episode_stats['placements_failed'] += 1
-            self.episode_stats['failure_reasons'].append(failure_reason or 'unknown')
+            self.episode_stats['total_reward'] += reward
+            
+            self._advance_to_next_pipeline()
+            
+            terminated = self.current_pipeline_idx >= len(self.pipelines_queue)
+            truncated = self.current_step >= self.config.max_episode_steps
+            
+            obs = self._get_observation()
+            info = self._get_info()
+            info['placement_result'] = 'failed'
+            info['time_elapsed'] = time_elapsed
+            
+            return obs, reward, terminated, truncated, info
         
+        # === 6. PLACEMENT RIUSCITO ===
+        
+        # Calcola tempo di esecuzione
+        is_data_local = self._is_data_local(pipeline['data_location'], cluster_name)
+        latency = 0.0 if is_data_local else self.network_model.get_latency(
+            pipeline['data_location'], cluster_name
+        )
+        
+        exec_time = self.exec_simulator.simulate(
+            pipeline_cpu=pipeline['cpu_required'],
+            pipeline_memory=pipeline['memory_required'],
+            cluster_cpu_utilization=cluster_state.cpu_utilization,
+            cluster_memory_utilization=cluster_state.memory_utilization,
+            network_latency_ms=latency,
+            is_data_local=is_data_local
+        )
+        
+        # Calcola tempo IDEALE per questa pipeline (per normalizzazione reward)
+        ideal_exec_time = self.exec_simulator.simulate(
+            pipeline_cpu=pipeline['cpu_required'],
+            pipeline_memory=pipeline['memory_required'],
+            cluster_cpu_utilization=0.3,  # Cluster scarico ideale
+            cluster_memory_utilization=0.3,
+            network_latency_ms=0.0,  # Dati locali
+            is_data_local=True
+        )
+        
+        # Aggiungi job alla lista attivi (per rilascio risorse futuro)
+        self._add_active_job(pipeline, cluster_name, exec_time)
+        
+        # Calcola reward con normalizzazione dinamica
+        reward = self._calculate_reward(
+            pipeline=pipeline,
+            cluster_state=cluster_state,
+            exec_time=exec_time,
+            ideal_exec_time=ideal_exec_time,
+            is_data_local=is_data_local
+        )
+        
+        # Aggiorna statistiche
+        self.episode_stats['placements_successful'] += 1
         self.episode_stats['total_reward'] += reward
+        self.episode_stats['execution_times'].append(exec_time)
+        self.episode_stats['ideal_execution_times'].append(ideal_exec_time)
+        self.episode_stats['cluster_placements'][cluster_name] += 1
         
-        # Move to next pipeline
-        self.current_pipeline_idx += 1
+        if is_data_local:
+            self.episode_stats['data_locality_hits'] += 1
         
-        # Check termination
+        if cluster_state.cluster_type == "cloud":
+            if pipeline['size_category'] == PipelineSizeCategory.SMALL:
+                self.episode_stats['small_on_cloud'] += 1
+            elif pipeline['size_category'] == PipelineSizeCategory.LARGE:
+                self.episode_stats['large_on_cloud'] += 1
+        
+        # Traccia categoria pipeline piazzata (diagnostica)
+        cat = pipeline['size_category']
+        if cat in self.episode_stats['pipeline_categories_placed']:
+            self.episode_stats['pipeline_categories_placed'][cat] += 1
+        
+        # Avanza alla prossima pipeline
+        self._advance_to_next_pipeline()
+        
+        # Check terminazione
         terminated = self.current_pipeline_idx >= len(self.pipelines_queue)
         truncated = self.current_step >= self.config.max_episode_steps
         
-        # Get new observation
+        # Bonus fine episodio
+        if terminated:
+            reward += self._calculate_episode_bonus()
+        
         obs = self._get_observation()
         info = self._get_info()
-        info['placement_success'] = placement_success
+        info['placement_result'] = 'success'
+        info['exec_time'] = exec_time
+        info['ideal_exec_time'] = ideal_exec_time
+        info['is_data_local'] = is_data_local
+        info['target_cluster'] = cluster_name
+        info['time_elapsed'] = time_elapsed
+        info['active_jobs'] = len(self.active_jobs)
         
         return obs, reward, terminated, truncated, info
     
-    def _try_place_pipeline(
-        self,
-        pipeline: Dict,
-        cluster_name: str
-    ) -> Tuple[bool, float, Optional[str]]:
-        """
-        Tenta placement della pipeline su cluster specificato.
+    def _advance_to_next_pipeline(self):
+        """Avanza alla prossima pipeline nella coda."""
+        self.current_pipeline_idx += 1
         
-        Returns:
-            (success, reward, failure_reason)
-        """
-        cluster = self.clusters_state[cluster_name]
-        
-        # Check risorse sufficienti
-        if (cluster['cpu_available'] < pipeline['cpu_required'] or
-            cluster['memory_available'] < pipeline['memory_required']):
-            # FALLIMENTO - risorse insufficienti
-            return False, self.config.penalty_failed_placement, 'insufficient_resources'
-        
-        # SUCCESSO - Placement riuscito
-        # Update cluster state
-        cluster['cpu_used'] += pipeline['cpu_required']
-        cluster['memory_used'] += pipeline['memory_required']
-        cluster['cpu_available'] -= pipeline['cpu_required']
-        cluster['memory_available'] -= pipeline['memory_required']
-        cluster['placements_count'] += 1
-        
-        # Simula execution time
-        is_data_local = (pipeline['data_location'] == cluster_name or
-                        pipeline['data_location'] == "none")
-        
-        if not is_data_local:
-            network_latency = self.network_latency_model.get_latency(
-                pipeline['data_location'], cluster_name
-            )
+        if self.current_pipeline_idx < len(self.pipelines_queue):
+            self._current_pipeline = self.pipelines_queue[self.current_pipeline_idx]
         else:
-            network_latency = 0.0
+            self._current_pipeline = None
         
-        exec_time = self.exec_time_sim.simulate(
-            pipeline_cpu=pipeline['cpu_required'],
-            pipeline_memory=pipeline['memory_required'],
-            cluster_cpu_available=cluster['cpu_available'],
-            cluster_memory_available=cluster['memory_available'],
-            network_latency=network_latency,
-            is_data_local=is_data_local
-        )
+        # Invalida action mask cache
+        self._current_action_mask = None
+    
+    def _simulate_time_advance(self):
+        """
+        Simula il passaggio del tempo tra arrivi di pipeline usando Poisson process.
         
-        self.episode_stats['execution_times'].append(exec_time)
+        Il tempo tra arrivi segue una distribuzione esponenziale con media
+        avg_inter_arrival_time. Questo crea pattern realistici:
+        - A volte burst di richieste ravvicinate
+        - A volte periodi di calma che permettono ai cluster di svuotarsi
+        """
+        # Genera tempo inter-arrivo con distribuzione esponenziale
+        inter_arrival_time = np.random.exponential(self.config.avg_inter_arrival_time)
         
-        # Calcola reward
-        reward = self._calculate_reward(
-            pipeline=pipeline,
-            cluster=cluster,
-            cluster_name=cluster_name,
-            exec_time=exec_time,
-            is_data_local=is_data_local
-        )
+        # Avanza il tempo simulato
+        self.current_time += inter_arrival_time
         
-        return True, reward, None
+        return inter_arrival_time
+    
+    def _update_active_jobs(self):
+        """
+        Controlla i job attivi e rilascia risorse per quelli completati.
+        
+        Questa funzione implementa il rilascio risorse:
+        - Ogni job ha un finish_time calcolato quando viene piazzato
+        - Quando current_time supera finish_time, il job è completato
+        - Le risorse (CPU, memoria) vengono restituite al cluster
+        """
+        if not self.config.enable_resource_release:
+            return
+        
+        completed_jobs = []
+        remaining_jobs = []
+        
+        for job in self.active_jobs:
+            if self.current_time >= job['finish_time']:
+                # Job completato - rilascia risorse
+                cluster = self.clusters_state[job['cluster_name']]
+                cluster.release(job['cpu'], job['memory'])
+                completed_jobs.append(job)
+                self.episode_stats['resources_released'] += 1
+            else:
+                remaining_jobs.append(job)
+        
+        self.active_jobs = remaining_jobs
+        
+        # Invalida action mask cache perché lo spazio disponibile è cambiato
+        if completed_jobs:
+            self._current_action_mask = None
+    
+    def _add_active_job(self, pipeline: Dict, cluster_name: str, exec_time: float):
+        """
+        Aggiunge un job alla lista dei job attivi.
+        
+        Args:
+            pipeline: Pipeline piazzata
+            cluster_name: Cluster su cui è stata piazzata
+            exec_time: Tempo di esecuzione stimato
+        """
+        if not self.config.enable_resource_release:
+            return
+        
+        job = {
+            'pipeline_id': pipeline['id'],
+            'cluster_name': cluster_name,
+            'cpu': pipeline['cpu_required'],
+            'memory': pipeline['memory_required'],
+            'start_time': self.current_time,
+            'finish_time': self.current_time + exec_time,
+        }
+        self.active_jobs.append(job)
+    
+    def _is_data_local(self, data_location: str, cluster_name: str) -> bool:
+        """Verifica se i dati sono locali al cluster."""
+        if data_location == "distributed":
+            return False
+        if data_location == "none":
+            return True  # Nessun dato da trasferire
+        return data_location == cluster_name
+    
+    # =========================================================================
+    # REWARD CALCULATION
+    # =========================================================================
     
     def _calculate_reward(
         self,
         pipeline: Dict,
-        cluster: Dict,
-        cluster_name: str,
+        cluster_state: SimulatedClusterState,
         exec_time: float,
+        ideal_exec_time: float,
         is_data_local: bool
     ) -> float:
         """
         Calcola reward per placement riuscito.
         
-        COMPONENTI REWARD V2.1 - BALANCED:
-        1. Base success bonus
-        2. Data locality bonus/penalty (CRITICO - aumentato peso)
-        3. Balanced utilization bonus
-        4. Cluster diversity + monopoly prevention (migliorato)
-        5. Edge clusters balance (NUOVO)
-        6. Cloud usage incentive (NUOVO)
-        7. Penalty per overload/underutilization
+        NORMALIZZAZIONE DINAMICA:
+        Il tempo di esecuzione viene confrontato con il tempo IDEALE specifico
+        per questa pipeline, non con una costante fissa. Questo evita che:
+        - Pipeline piccole (10s) ricevano bonus enormi anche se piazzate male
+        - Pipeline grandi (80s) vengano penalizzate anche se piazzate ottimamente
+        
+        COMPONENTI:
+        1. Tempo di esecuzione (normalizzato dinamicamente)
+        2. Data locality (secondario)
+        3. Strategic placement (anti-miopatia)
+        4. Bilanciamento cluster
         """
-        reward = self.config.bonus_successful_placement  # Base: +100
+        reward = 0.0
         
-        # === 1. DATA LOCALITY (PRIORITÀ MASSIMA) ===
+        # === 1. TEMPO DI ESECUZIONE (Normalizzazione Dinamica) ===
+        # Ratio: quanto peggio del tempo ideale?
+        # ratio = 1.0 → perfetto (tempo == ideale)
+        # ratio = 1.5 → 50% più lento del possibile
+        # ratio = 2.0 → doppio del tempo ideale
+        
+        time_ratio = exec_time / max(ideal_exec_time, 1.0)
+        
+        # Reward: più vicino a 1.0 = meglio
+        # time_ratio = 1.0 → reward = 0.3 * (2.0 - 1.0) = 0.3
+        # time_ratio = 1.2 → reward = 0.3 * (2.0 - 1.2) = 0.24
+        # time_ratio = 1.5 → reward = 0.3 * (2.0 - 1.5) = 0.15
+        # time_ratio = 2.0 → reward = 0.3 * (2.0 - 2.0) = 0.0
+        # time_ratio > 2.0 → reward negativo
+        time_reward = self.config.reward_time_weight * (2.0 - min(time_ratio, 3.0))
+        reward += time_reward
+        
+        # === 2. DATA LOCALITY ===
         if is_data_local:
-            reward += self.config.bonus_data_locality  # +200
+            reward += self.config.reward_data_locality
         else:
-            # ⚠️ FIX CRITICO: Penalty remote MOLTO più alta
-            reward += self.config.penalty_remote_placement  # -180 (era -20)
+            reward += self.config.penalty_remote_placement
         
-        # === 2. BALANCED UTILIZATION ===
-        cpu_util = cluster['cpu_used'] / max(cluster['cpu_capacity'], 1)
-        mem_util = cluster['memory_used'] / max(cluster['memory_capacity'], 1)
-        avg_util = (cpu_util + mem_util) / 2.0
+        # === 3. STRATEGIC PLACEMENT (Anti-Miopatia) ===
+        size_category = pipeline['size_category']
         
-        if self.config.target_utilization_min <= avg_util <= self.config.target_utilization_max:
-            # Dentro range ottimale
-            distance_from_ideal = abs(avg_util - self.config.target_utilization_ideal)
-            balance_bonus = self.config.bonus_balanced_utilization * (1.0 - distance_from_ideal)
-            reward += balance_bonus
-        elif avg_util < self.config.target_utilization_min:
-            # Sottoutilizzo
-            reward += self.config.penalty_underutilization
-        elif avg_util > 0.90:
-            # Pericoloso - quasi saturo
-            reward += self.config.penalty_overload
+        if cluster_state.cluster_type == "cloud":
+            if size_category == PipelineSizeCategory.SMALL:
+                # PENALITÀ FORTE: stai sprecando il cloud con pipeline piccola!
+                reward += self.config.penalty_small_on_cloud
+            elif size_category == PipelineSizeCategory.LARGE:
+                # BONUS: uso appropriato del cloud
+                reward += self.config.bonus_large_on_cloud
+            # Medium su cloud: nessun bonus/penalità (neutro)
+        else:  # Edge cluster
+            if size_category == PipelineSizeCategory.SMALL:
+                # BONUS: pipeline piccola su edge è la scelta giusta
+                reward += self.config.bonus_small_on_edge
+            elif size_category == PipelineSizeCategory.MEDIUM:
+                # BONUS: anche medium dovrebbe preferire edge se entra
+                reward += self.config.bonus_medium_on_edge
         
-        # === 3. CLUSTER DIVERSITY & MONOPOLY PREVENTION (migliorato) ===
-        if cluster['placements_count'] == 1:
-            # Primo placement su questo cluster = buono
-            reward += self.config.bonus_new_cluster_usage  # +50
-        elif cluster['placements_count'] > len(self.pipelines_queue) * 0.5:  # ⚠️ Ridotto da 0.6 a 0.5
-            # Troppi placement su singolo cluster = male
-            reward += self.config.penalty_cluster_monopoly  # -200 (aumentato da -100)
+        # === 4. BILANCIAMENTO ===
+        avg_util = (cluster_state.cpu_utilization + cluster_state.memory_utilization) / 2.0
         
-        # === 4. ⚠️ NUOVO: EDGE CLUSTERS BALANCE ===
-        # Penalizza se gli edge cluster hanno utilizzo sbilanciato
-        edge_clusters = [c for c in self.clusters_state.values() 
-                         if c['cluster_type'] == 'edge']
-        
-        if len(edge_clusters) > 1 and cluster['cluster_type'] == 'edge':
-            edge_utils = [(c['cpu_used'] / max(c['cpu_capacity'], 1) + 
-                           c['memory_used'] / max(c['memory_capacity'], 1)) / 2.0 
-                          for c in edge_clusters]
-            
-            # Calcola variance dell'utilizzo tra edge
-            edge_variance = np.var(edge_utils)
-            
-            # Penalità se variance è alta (squilibrio)
-            if edge_variance > 0.05:  # Soglia: 5% di variance
-                imbalance_penalty = self.config.penalty_edge_imbalance * edge_variance
-                reward += imbalance_penalty  # Negativo (es. -120 * 0.1 = -12)
-        
-        # === 5. ⚠️ NUOVO: CLOUD USAGE INCENTIVE ===
-        # Bonus se usi il cloud quando è appropriato
-        if cluster['cluster_type'] == 'cloud':
-            # Bonus base per usare cloud (compensa costo percepito)
-            reward += self.config.bonus_cloud_usage * 0.5  # +40
-            
-            # Bonus extra se dati sono su cloud (evita transfer edge->cloud costoso)
-            if pipeline['data_location'] == 'cloud_cluster':
-                reward += self.config.bonus_cloud_usage * 0.5  # +40 extra → totale +80
+        if self.config.utilization_optimal_min <= avg_util <= self.config.utilization_optimal_max:
+            reward += self.config.reward_balanced_utilization
+        elif avg_util > self.config.utilization_danger:
+            reward += self.config.penalty_near_saturation
         
         return reward
     
-    def _calculate_episode_end_bonus(self) -> float:
-        """
-        Bonus/penalty a fine episodio basato su performance globale.
-        """
+    def _calculate_episode_bonus(self) -> float:
+        """Calcola bonus/penalità a fine episodio."""
         if len(self.pipelines_queue) == 0:
             return 0.0
         
-        success_rate = (self.episode_stats['placements_successful'] /
-                       len(self.pipelines_queue))
+        success_rate = self.episode_stats['placements_successful'] / len(self.pipelines_queue)
         
-        # PERFECT EPISODE BONUS
         if success_rate == 1.0:
-            return self.config.bonus_perfect_episode  # +500
-        
-        # Penalità proporzionale ai fallimenti
-        failure_rate = 1.0 - success_rate
-        penalty = failure_rate * abs(self.config.penalty_failed_placement)
-        
-        return -penalty
+            # Perfect episode!
+            return self.config.reward_perfect_episode
+        else:
+            # Penalità per ogni fallimento
+            failures = self.episode_stats['placements_failed']
+            return failures * self.config.penalty_per_failure
     
-    def _get_valid_actions_mask(self, pipeline: Dict) -> np.ndarray:
-        """
-        Genera action mask: True = azione valida, False = azione invalida.
-        
-        CRITICO per success rate: previene azioni su cluster saturi.
-        
-        Returns:
-            Array booleano di shape (num_clusters,)
-        """
-        mask = np.ones(self.config.num_clusters, dtype=bool)
-        
-        for i, cluster_config in enumerate(self.config.clusters):
-            cluster = self.clusters_state[cluster_config.name]
-            
-            # Verifica risorse sufficienti
-            has_cpu = cluster['cpu_available'] >= pipeline['cpu_required']
-            has_memory = cluster['memory_available'] >= pipeline['memory_required']
-            
-            if not (has_cpu and has_memory):
-                mask[i] = False  # Maschera questa azione
-        
-        # Fallback safety: se TUTTE le azioni sono mascherate, abilita cloud
-        if not mask.any():
-            # Abilita cloud_cluster come fallback
-            cloud_idx = next(i for i, c in enumerate(self.config.clusters)
-                           if c.cluster_type == "cloud")
-            mask[cloud_idx] = True
-        
-        return mask
-    
-    def get_action_mask(self) -> np.ndarray:
-        """
-        Public API per MaskablePPO.
-        
-        Returns:
-            Current action mask
-        """
-        if self.current_pipeline_idx >= len(self.pipelines_queue):
-            # Episode finito - ritorna mask tutto true
-            return np.ones(self.config.num_clusters, dtype=bool)
-        
-        pipeline = self.pipelines_queue[self.current_pipeline_idx]
-        return self._get_valid_actions_mask(pipeline)
+    # =========================================================================
+    # OBSERVATION
+    # =========================================================================
     
     def _get_observation(self) -> np.ndarray:
         """
-        Costruisce observation vector con feature engineering avanzato.
+        Costruisce observation vector (28 features).
         
-        STRUTTURA STATE v2.1 - ENHANCED:
-        - Per ogni cluster (9 features):
-            1-9. (Come prima)
-        
-        - Global features (9 features - AUMENTATO da 6):
-            1-6. (Come prima)
-            7. Cloud vs Edge utilization ratio (NUOVO)
-            8. Edge clusters imbalance (NUOVO)
-            9. Data transfer cost estimate (NUOVO)
-        
-        - Temporal features (5):
-            1-5. (Come prima)
-        
-        Returns:
-            State vector (numpy array)
+        LAYOUT:
+        [0-19]  Per-cluster features (5 × 4 cluster)
+        [20-23] Pipeline features (4)
+        [24-27] Global features (4)
         """
-        state = []
+        obs = []
         
-        # Current pipeline (se disponibile)
-        if self.current_pipeline_idx < len(self.pipelines_queue):
-            pipeline = self.pipelines_queue[self.current_pipeline_idx]
-        else:
-            # Episode finito - usa valori dummy
-            pipeline = {
-                'cpu_required': 0,
-                'memory_required': 0,
-                'data_location': "none"
-            }
-        
-        # === PER-CLUSTER FEATURES (9 per cluster) ===
+        # === PER-CLUSTER FEATURES (20 features) ===
         for cluster_config in self.config.clusters:
             cluster = self.clusters_state[cluster_config.name]
             
-            # 1-2. Utilization
-            cpu_util = cluster['cpu_used'] / max(cluster['cpu_capacity'], 1)
-            mem_util = cluster['memory_used'] / max(cluster['memory_capacity'], 1)
+            # [0] CPU available ratio (0-1)
+            cpu_avail_ratio = cluster.cpu_available / cluster.cpu_capacity
+            obs.append(cpu_avail_ratio)
             
-            # 3-4. Available (normalized)
-            cpu_avail_norm = cluster['cpu_available'] / max(cluster['cpu_capacity'], 1)
-            mem_avail_norm = cluster['memory_available'] / max(cluster['memory_capacity'], 1)
+            # [1] Memory available ratio (0-1)
+            mem_avail_ratio = cluster.memory_available / cluster.memory_capacity
+            obs.append(mem_avail_ratio)
             
-            # 5. Safety margin
-            safety_margin = min(cpu_avail_norm, mem_avail_norm)
+            # [2] Is data local (0 or 1)
+            if self._current_pipeline:
+                is_local = float(self._is_data_local(
+                    self._current_pipeline['data_location'], 
+                    cluster.name
+                ))
+            else:
+                is_local = 0.0
+            obs.append(is_local)
             
-            # 6. Stress level
-            stress_level = (cpu_util + mem_util) / 2.0
+            # [3] Can fit pipeline (0 or 1)
+            if self._current_pipeline:
+                can_fit = float(cluster.can_fit(
+                    self._current_pipeline['cpu_required'],
+                    self._current_pipeline['memory_required']
+                ))
+            else:
+                can_fit = 0.0
+            obs.append(can_fit)
             
-            # 7. Balance score
-            balance_score = 1.0 - abs(cpu_util - mem_util)
+            # [4] Is cloud (0 or 1)
+            is_cloud = float(cluster.cluster_type == "cloud")
+            obs.append(is_cloud)
+        
+        # === PIPELINE FEATURES (4 features) ===
+        if self._current_pipeline:
+            pipeline = self._current_pipeline
             
-            # 8. Headroom
-            headroom = (cpu_avail_norm + mem_avail_norm) / 2.0
+            # [20] Pipeline CPU ratio (normalized by max available)
+            max_cpu = self.config.max_cpu_available
+            cpu_ratio = pipeline['cpu_required'] / max_cpu if max_cpu > 0 else 0.0
+            obs.append(min(cpu_ratio, 2.0))  # Cap at 2.0
             
-            # 9. Is data cluster
-            is_data_cluster = 1.0 if cluster['name'] == pipeline['data_location'] else 0.0
+            # [21] Pipeline memory ratio
+            max_mem = self.config.max_memory_available
+            mem_ratio = pipeline['memory_required'] / max_mem if max_mem > 0 else 0.0
+            obs.append(min(mem_ratio, 2.0))
             
-            state.extend([
-                cpu_util, mem_util,
-                cpu_avail_norm, mem_avail_norm,
-                safety_margin, stress_level, balance_score,
-                headroom, is_data_cluster
-            ])
-        
-        # === GLOBAL FEATURES (9 features - AUMENTATO da 6) ===
-        # Normalize pipeline requirements
-        avg_cpu_capacity = np.mean([c['cpu_capacity'] for c in self.clusters_state.values()])
-        avg_mem_capacity = np.mean([c['memory_capacity'] for c in self.clusters_state.values()])
-        
-        pipeline_cpu_norm = pipeline['cpu_required'] / max(avg_cpu_capacity, 1)
-        pipeline_mem_norm = pipeline['memory_required'] / max(avg_mem_capacity, 1)
-        
-        # Placement difficulty
-        placement_difficulty = max(pipeline_cpu_norm, pipeline_mem_norm)
-        
-        # Episode progress
-        episode_progress = self.current_pipeline_idx / max(len(self.pipelines_queue), 1)
-        
-        # Success rate so far
-        total_placements = self.episode_stats['placements_successful'] + self.episode_stats['placements_failed']
-        success_rate = (self.episode_stats['placements_successful'] / total_placements
-                       if total_placements > 0 else 0.0)
-        
-        # Data locality flag
-        is_data_local = 1.0 if pipeline['data_location'] != "none" else 0.0
-        
-        # Features 1-6 (originali)
-        state.extend([
-            pipeline_cpu_norm,
-            pipeline_mem_norm,
-            placement_difficulty,
-            episode_progress,
-            success_rate,
-            is_data_local
-        ])
-        
-        # ⚠️ NUOVE FEATURES 7-9 per bilanciamento
-        
-        # 7. Cloud vs Edge utilization ratio
-        cloud_clusters = [c for c in self.clusters_state.values() if c['cluster_type'] == 'cloud']
-        edge_clusters = [c for c in self.clusters_state.values() if c['cluster_type'] == 'edge']
-        
-        if cloud_clusters and edge_clusters:
-            cloud_avg_util = np.mean([(c['cpu_used']/max(c['cpu_capacity'], 1) + 
-                                       c['memory_used']/max(c['memory_capacity'], 1))/2.0 
-                                      for c in cloud_clusters])
-            edge_avg_util = np.mean([(c['cpu_used']/max(c['cpu_capacity'], 1) + 
-                                      c['memory_used']/max(c['memory_capacity'], 1))/2.0 
-                                     for c in edge_clusters])
-            cloud_edge_ratio = cloud_avg_util / (edge_avg_util + 1e-6)
+            # [22] Pipeline size category (0=small, 0.5=medium, 1=large)
+            obs.append(pipeline['size_value'])
+            
+            # [23] Fits on any edge (0 or 1)
+            fits_any_edge = any(
+                self.clusters_state[c.name].can_fit(
+                    pipeline['cpu_required'],
+                    pipeline['memory_required']
+                )
+                for c in self.config.clusters if c.cluster_type == "edge"
+            )
+            obs.append(float(fits_any_edge))
         else:
-            cloud_edge_ratio = 1.0
+            # No pipeline: zeros
+            obs.extend([0.0, 0.0, 0.0, 0.0])
         
-        state.append(cloud_edge_ratio)
+        # === GLOBAL FEATURES (4 features) ===
         
-        # 8. Edge clusters imbalance (variance)
-        if len(edge_clusters) > 1:
-            edge_utils = [(c['cpu_used']/max(c['cpu_capacity'], 1) + 
-                           c['memory_used']/max(c['memory_capacity'], 1))/2.0 
-                          for c in edge_clusters]
-            edge_imbalance = np.std(edge_utils)
+        # [24] Cloud CPU headroom (quanto spazio strategico ha il cloud)
+        cloud = self.clusters_state.get("cloud_cluster")
+        if cloud:
+            cloud_headroom = cloud.cpu_available / cloud.cpu_capacity
         else:
-            edge_imbalance = 0.0
+            cloud_headroom = 0.0
+        obs.append(cloud_headroom)
         
-        state.append(edge_imbalance)
+        # [25] Average edge utilization
+        edge_utils = [
+            (self.clusters_state[c.name].cpu_utilization + 
+             self.clusters_state[c.name].memory_utilization) / 2.0
+            for c in self.config.clusters if c.cluster_type == "edge"
+        ]
+        avg_edge_util = np.mean(edge_utils) if edge_utils else 0.0
+        obs.append(avg_edge_util)
         
-        # 9. Data transfer cost estimate (se non è local)
-        if pipeline['data_location'] != 'none':
-            # Stima costo in base a distanza logica
-            data_loc = pipeline['data_location']
-            
-            # Calcola "distanza" media dai dati per ogni cluster possibile
-            transfer_costs = []
-            for cluster_config in self.config.clusters:
-                if cluster_config.name == data_loc:
-                    cost = 0.0  # Local
-                elif (data_loc == 'cloud_cluster' and cluster_config.cluster_type == 'edge') or \
-                     (cluster_config.name == 'cloud_cluster' and data_loc in [c.name for c in self.config.clusters if c.cluster_type == 'edge']):
-                    cost = 1.0  # Cloud<->Edge (alto)
-                else:
-                    cost = 0.5  # Edge<->Edge (medio)
-                transfer_costs.append(cost)
-            
-            avg_transfer_cost = np.mean(transfer_costs)
-        else:
-            avg_transfer_cost = 0.0
+        # [26] Utilization variance (sbilanciamento)
+        all_utils = [
+            (self.clusters_state[c.name].cpu_utilization + 
+             self.clusters_state[c.name].memory_utilization) / 2.0
+            for c in self.config.clusters
+        ]
+        util_variance = np.var(all_utils) if all_utils else 0.0
+        # Normalizza variance (tipicamente 0-0.1)
+        obs.append(min(util_variance * 10, 1.0))
         
-        state.append(avg_transfer_cost)
-        
-        # === TEMPORAL FEATURES (5) ===
-        # Media execution time fino ad ora
-        avg_exec_time = (np.mean(self.episode_stats['execution_times'])
-                        if self.episode_stats['execution_times'] else 0.0)
-        avg_exec_time_norm = avg_exec_time / max(self.config.baseline_execution_time, 1)
-        
-        state.append(avg_exec_time_norm)
-        
-        # Padding per temporal features (4 slot riservati)
-        state.extend([0.0] * 4)
-        
-        return np.array(state, dtype=np.float32)
-    
-    def _get_info(self) -> Dict:
-        """Ritorna info dict con statistiche episodio"""
+        # [27] Pipelines remaining ratio
         if len(self.pipelines_queue) > 0:
-            success_rate = (self.episode_stats['placements_successful'] /
-                           len(self.pipelines_queue))
+            remaining = (len(self.pipelines_queue) - self.current_pipeline_idx) / len(self.pipelines_queue)
+        else:
+            remaining = 0.0
+        obs.append(remaining)
+        
+        return np.array(obs, dtype=np.float32)
+    
+    # =========================================================================
+    # ACTION MASKING
+    # =========================================================================
+    
+    def action_masks(self) -> np.ndarray:
+        """
+        Ritorna action mask per MaskablePPO.
+        
+        True = azione valida (cluster può ospitare pipeline)
+        False = azione invalida (cluster saturo)
+        """
+        if self._current_action_mask is not None:
+            return self._current_action_mask
+        
+        mask = np.zeros(self.config.num_clusters, dtype=bool)
+        
+        if self._current_pipeline is None:
+            # Nessuna pipeline: tutte le azioni invalide
+            return mask
+        
+        pipeline = self._current_pipeline
+        
+        for i, cluster_config in enumerate(self.config.clusters):
+            cluster = self.clusters_state[cluster_config.name]
+            if cluster.can_fit(pipeline['cpu_required'], pipeline['memory_required']):
+                mask[i] = True
+        
+        # Se nessun cluster può ospitare, abilita tutti (l'agente fallirà ma deve scegliere)
+        if not mask.any():
+            mask[:] = True
+        
+        self._current_action_mask = mask
+        return mask
+    
+    # Alias per compatibilità con sb3-contrib
+    def get_action_mask(self) -> np.ndarray:
+        """Alias per action_masks()."""
+        return self.action_masks()
+    
+    # =========================================================================
+    # INFO & RENDER
+    # =========================================================================
+    
+    def _get_info(self) -> Dict[str, Any]:
+        """Ritorna info dict con statistiche episodio."""
+        total_pipelines = len(self.pipelines_queue)
+        
+        if total_pipelines > 0:
+            success_rate = self.episode_stats['placements_successful'] / total_pipelines
+            locality_rate = self.episode_stats['data_locality_hits'] / max(1, self.episode_stats['placements_successful'])
         else:
             success_rate = 0.0
+            locality_rate = 0.0
         
-        avg_exec_time = (np.mean(self.episode_stats['execution_times'])
-                        if self.episode_stats['execution_times'] else 0.0)
+        avg_exec_time = (
+            np.mean(self.episode_stats['execution_times'])
+            if self.episode_stats['execution_times'] else 0.0
+        )
+        
+        # Calcola efficienza media (actual_time / ideal_time)
+        if self.episode_stats['execution_times'] and self.episode_stats['ideal_execution_times']:
+            efficiencies = [
+                ideal / actual if actual > 0 else 0.0
+                for actual, ideal in zip(
+                    self.episode_stats['execution_times'],
+                    self.episode_stats['ideal_execution_times']
+                )
+            ]
+            avg_efficiency = np.mean(efficiencies)
+        else:
+            avg_efficiency = 0.0
         
         return {
             'step': self.current_step,
             'pipeline_idx': self.current_pipeline_idx,
+            'total_pipelines': total_pipelines,
             'success_rate': success_rate,
+            'locality_rate': locality_rate,
+            'avg_exec_time': avg_exec_time,
+            'avg_efficiency': avg_efficiency,  # 1.0 = perfetto, <1.0 = overhead
+            'total_reward': self.episode_stats['total_reward'],
             'placements_successful': self.episode_stats['placements_successful'],
             'placements_failed': self.episode_stats['placements_failed'],
-            'avg_exec_time': avg_exec_time,
-            'total_reward': self.episode_stats['total_reward'],
-            'cluster_placements': self.episode_stats['cluster_placements_count'],
-            'failure_reasons': self.episode_stats.get('failure_reasons', [])
+            'placements_failed_contention': self.episode_stats['placements_failed_contention'],
+            'small_on_cloud': self.episode_stats['small_on_cloud'],
+            'large_on_cloud': self.episode_stats['large_on_cloud'],
+            'cluster_placements': self.episode_stats['cluster_placements'].copy(),
+            'resources_released': self.episode_stats['resources_released'],
+            'active_jobs': len(self.active_jobs),
+            'current_time': self.current_time,
+            # Diagnostica categorie pipeline
+            'pipeline_categories': self.episode_stats['pipeline_categories'].copy(),
+            'pipeline_categories_placed': self.episode_stats['pipeline_categories_placed'].copy(),
         }
     
     def render(self):
-        """Render environment state (human readable)"""
+        """Render environment state."""
         if self.render_mode == "human":
-            print("\n" + "="*60)
-            print(f"Step: {self.current_step} | Pipeline: {self.current_pipeline_idx}/{len(self.pipelines_queue)}")
-            print("-"*60)
+            self._render_human()
+        elif self.render_mode == "ansi":
+            return self._render_ansi()
+    
+    def _render_human(self):
+        """Output leggibile per debugging."""
+        print("\n" + "=" * 70)
+        print(f"Step: {self.current_step} | Pipeline: {self.current_pipeline_idx + 1}/{len(self.pipelines_queue)} | "
+              f"Time: {self.current_time:.1f}s | Active Jobs: {len(self.active_jobs)}")
+        print("-" * 70)
+        
+        # Stato cluster
+        for cluster_config in self.config.clusters:
+            cluster = self.clusters_state[cluster_config.name]
+            cpu_pct = cluster.cpu_utilization * 100
+            mem_pct = cluster.memory_utilization * 100
+            placements = cluster.placements_count
             
-            for cluster_name, cluster in self.clusters_state.items():
-                cpu_util = cluster['cpu_used'] / cluster['cpu_capacity'] * 100
-                mem_util = cluster['memory_used'] / cluster['memory_capacity'] * 100
-                print(f"{cluster_name:20s} | CPU: {cpu_util:5.1f}% | MEM: {mem_util:5.1f}% | "
-                      f"Placements: {cluster['placements_count']}")
+            bar_len = 20
+            cpu_bar = "█" * int(cpu_pct / 100 * bar_len) + "░" * (bar_len - int(cpu_pct / 100 * bar_len))
             
-            print("-"*60)
-            info = self._get_info()
-            print(f"Success Rate: {info['success_rate']*100:.1f}% | "
-                  f"Avg Exec Time: {info['avg_exec_time']:.2f}s")
-            print("="*60)
+            # Conta job attivi su questo cluster
+            active_on_cluster = sum(1 for j in self.active_jobs if j['cluster_name'] == cluster.name)
+            
+            print(f"  {cluster.name:15s} | CPU: [{cpu_bar}] {cpu_pct:5.1f}% | "
+                  f"MEM: {mem_pct:5.1f}% | Jobs: {active_on_cluster}")
+        
+        print("-" * 70)
+        
+        # Pipeline corrente
+        if self._current_pipeline:
+            p = self._current_pipeline
+            print(f"  Current: {p['name']} | {p['cpu_required']}m CPU | "
+                  f"{p['memory_required']/(1024**2):.0f}MB | "
+                  f"Data: {p['data_location']} | Size: {p['size_category']}")
+        
+        # Stats
+        info = self._get_info()
+        print(f"\n  Success: {info['success_rate']*100:.1f}% | "
+              f"Efficiency: {info['avg_efficiency']*100:.1f}% | "
+              f"Contention Fails: {info['placements_failed_contention']} | "
+              f"Released: {info['resources_released']}")
+        print("=" * 70)
+    
+    def _render_ansi(self) -> str:
+        """Ritorna stringa per logging."""
+        info = self._get_info()
+        return (f"Step {self.current_step}: "
+                f"success={info['success_rate']*100:.0f}% "
+                f"reward={info['total_reward']:.2f}")
     
     def close(self):
-        """Cleanup"""
+        """Cleanup."""
         pass
 
 
-# ========== TESTING ==========
+# =============================================================================
+# TESTING
+# =============================================================================
+
 if __name__ == "__main__":
-    print("Testing CloudContinuumEnv v2.1...")
+    print("=" * 70)
+    print("CloudContinuum Environment Test")
+    print("=" * 70)
     
-    env = CloudContinuumEnv()
+    # Test con configurazione default
+    env = CloudContinuumEnv(render_mode="human")
     
-    print("\n1. Reset environment:")
+    print(f"\n📐 Environment Specs:")
+    print(f"  Observation space: {env.observation_space.shape}")
+    print(f"  Action space: {env.action_space.n} clusters")
+    
+    print("\n🔄 Testing reset...")
     obs, info = env.reset(seed=42)
     print(f"  Observation shape: {obs.shape}")
-    print(f"  Expected shape: {env.config.total_state_size}")
-    print(f"  Action space: {env.action_space}")
-    print(f"  Pipelines in queue: {len(env.pipelines_queue)}")
+    print(f"  Pipelines in queue: {info['total_pipelines']}")
     
-    print("\n2. Testing action masking:")
-    mask = env.get_action_mask()
-    print(f"  Action mask: {mask}")
-    print(f"  Valid actions: {np.where(mask)[0]}")
+    print("\n🎮 Running episode with random valid actions...")
+    env.render()
     
-    print("\n3. Running 5 random steps with masking:")
-    for i in range(5):
-        mask = env.get_action_mask()
+    total_reward = 0
+    step = 0
+    
+    while True:
+        # Get valid actions
+        mask = env.action_masks()
         valid_actions = np.where(mask)[0]
         
-        if len(valid_actions) > 0:
-            action = np.random.choice(valid_actions)
-        else:
-            action = 0  # Fallback
+        if len(valid_actions) == 0:
+            print("  No valid actions!")
+            break
+        
+        # Random valid action
+        action = np.random.choice(valid_actions)
         
         obs, reward, terminated, truncated, info = env.step(action)
-        print(f"  Step {i+1}: action={action}, reward={reward:.1f}, "
-              f"success_rate={info['success_rate']*100:.1f}%")
+        total_reward += reward
+        step += 1
+        
+        if step <= 3 or terminated:
+            env.render()
         
         if terminated or truncated:
             break
     
-    print("\n✅ Environment test completed!")
-    print(f"✅ Cluster placements distribution: {info['cluster_placements']}")
+    print(f"\n📊 Episode Summary:")
+    print(f"  Total steps: {step}")
+    print(f"  Total reward: {total_reward:.2f}")
+    print(f"  Success rate: {info['success_rate']*100:.1f}%")
+    print(f"  Avg exec time: {info['avg_exec_time']:.1f}s")
+    print(f"  Data locality: {info['locality_rate']*100:.1f}%")
+    print(f"  Small on cloud: {info['small_on_cloud']}")
+    print(f"  Large on cloud: {info['large_on_cloud']}")
+    print(f"  Cluster distribution: {info['cluster_placements']}")
+    
+    # Test action masking
+    print("\n🎭 Testing Action Masking...")
+    obs, _ = env.reset(seed=123)
+    
+    for i in range(3):
+        mask = env.action_masks()
+        print(f"  Pipeline {i+1}: mask = {mask}, valid = {np.where(mask)[0]}")
+        
+        action = np.random.choice(np.where(mask)[0])
+        obs, reward, done, _, _ = env.step(action)
+        
+        if done:
+            break
+    
+    print("\n" + "=" * 70)
+    print("✅ Environment Test Completed!")
+    print("=" * 70)
