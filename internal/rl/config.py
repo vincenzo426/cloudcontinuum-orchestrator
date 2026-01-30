@@ -300,7 +300,7 @@ class EnvironmentConfig:
     latency_impact_factor: float = 0.5
     # Fattore contesa: quanto un cluster carico rallenta l'esecuzione
     contention_impact_factor: float = 0.5
-    
+
     # ==================== POISSON PROCESS (Arrivo Pipeline) ====================
     # Tempo medio tra arrivi di pipeline (secondi) - distribuzione esponenziale
     # Valore basso = burst frequenti, valore alto = arrivi diluiti
@@ -312,7 +312,7 @@ class EnvironmentConfig:
     
     # ==================== CONTENTION MODEL (Probabilità Fallimento) ====================
     # Soglia di utilizzo oltre la quale il modello di contesa viene attivato
-    contention_activation_threshold: float = 0.85
+    contention_activation_threshold: float = 0.75
     # Se True, un cluster molto carico può far fallire il placement stocasticamente
     enable_stochastic_failure: bool = True
     

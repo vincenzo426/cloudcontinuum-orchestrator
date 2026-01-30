@@ -270,6 +270,10 @@ func (c *RealMetricsCollector) measureLatencies(ctx context.Context, metrics *pl
 
 			latency := c.measureLatency(ctx, toClient)
 
+			// --- AGGIUNGI QUESTA RIGA ---
+			logger.Info("[LATENCY CHECK]", "From", fromCluster, "To", toCluster, "Latency(ms)", latency)
+			// -----------------------------
+
 			// Imposta il campo latenza appropriato (inline switch)
 			switch toCluster {
 			case edgeCluster1:

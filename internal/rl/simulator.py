@@ -264,25 +264,37 @@ class ResourceContentionModel:
                                 pipeline_memory_ratio: float) -> float:
         """
         Stima probabilità di fallimento del placement.
-        
-        Anche se nominalmente c'è spazio, un cluster molto carico
-        potrebbe avere problemi di scheduling.
+        Soglie basate su utilizzo CPU e memoria.
+        MODIFICATO PER LATENZA METRICHE (20s):
+        Le soglie sono state abbassate per creare un 'safety buffer'.
+        L'agente deve percepire il rischio già al 75% perché i dati reali
+        potrebbero essere già all'85-90%.
         
         Returns:
             Probabilità di fallimento (0-1)
         """
-        # Se cluster è sotto 80% utilizzo, probabilità quasi zero
-        if cpu_utilization < 0.8 and memory_utilization < 0.8:
+        # SOGLIA DI SICUREZZA: 75% (allineata con config.contention_activation_threshold)
+        # Se siamo sotto il 75%, siamo ragionevolmente sicuri anche con metriche vecchie.
+        if cpu_utilization < 0.75 and memory_utilization < 0.75:
             return 0.0
         
-        # Sopra 90%, probabilità aumenta rapidamente
         max_util = max(cpu_utilization, memory_utilization)
         
-        if max_util < 0.9:
+        # GRADIENTE DI RISCHIO ANTICIPATO
+        if max_util < 0.85:
+            # Fascia 75% - 85%: Zona "Gialla"
+            # Qui il cluster sembra ok, ma a causa del lag potrebbe essere pieno.
+            # Introduciamo un rischio basso (5%) per scoraggiare l'uso massiccio.
             return 0.05
-        elif max_util < 0.95:
+            
+        elif max_util < 0.90:
+            # Fascia 85% - 90%: Zona "Arancione"
+            # Rischio significativo. Con 20s di lag, qui sei probabilmente già in crash.
             return 0.15
+            
         else:
+            # Fascia > 90%: Zona "Rossa"
+            # Fallimento molto probabile.
             return 0.30
 
 
