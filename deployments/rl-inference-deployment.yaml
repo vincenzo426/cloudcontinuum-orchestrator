@@ -37,7 +37,7 @@ spec:
     spec:
       containers:
       - name: rl-service
-        image: cenzo104/rl-inference:v2.0.2
+        image: cenzo104/rl-inference:v4.0.1
         imagePullPolicy: Always
         ports:
         - containerPort: 5000

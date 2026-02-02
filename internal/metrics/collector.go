@@ -25,9 +25,42 @@ const (
 	edgeCluster1 = "edge_cluster_1"
 	edgeCluster2 = "edge_cluster_2"
 	edgeCluster3 = "edge_cluster_3"
+
+	// === RESERVATION SETTINGS ===
+	// Quanto dura una reservation prima di scadere automaticamente.
+	// Deve essere abbastanza lungo da coprire il tempo necessario affinché
+	// i Pod diventino visibili nelle metriche K8s (tipicamente 10-30s).
+	defaultReservationTTL = 40 * time.Second
+
+	// Ogni quanto pulire le reservation scadute
+	cleanupInterval = 15 * time.Second
 )
 
 var clusterNames = []string{cloudCluster, edgeCluster1, edgeCluster2, edgeCluster3}
+
+// =============================================================================
+// IN-FLIGHT RESERVATION
+// =============================================================================
+
+// InFlightReservation rappresenta risorse riservate per una pipeline
+// che è stata schedulata ma i cui Pod non sono ancora visibili nelle metriche K8s.
+//
+// Questo risolve il problema dell'over-commit: quando l'agente RL decide di
+// piazzare una pipeline, i Pod non sono immediatamente visibili (possono volerci
+// 5-30 secondi). Senza reservation, l'agente potrebbe schedulare altre pipeline
+// sullo stesso cluster pensando che abbia ancora risorse disponibili.
+type InFlightReservation struct {
+	PipelineName string    // Nome della pipeline (per logging/debugging)
+	ClusterName  string    // Cluster su cui è stata schedulata
+	CPURequested int64     // millicores riservati
+	MemRequested int64     // bytes riservati
+	CreatedAt    time.Time // Quando è stata creata la reservation
+	ExpiresAt    time.Time // Quando scade (auto-cleanup)
+}
+
+// =============================================================================
+// REAL METRICS COLLECTOR
+// =============================================================================
 
 // RealMetricsCollector raccoglie metriche reali dai cluster Kubernetes.
 type RealMetricsCollector struct {
@@ -37,6 +70,11 @@ type RealMetricsCollector struct {
 	cache          *placement.ClusterMetrics
 	cacheTimestamp time.Time
 	cacheMutex     sync.RWMutex
+
+	// === IN-FLIGHT RESERVATIONS ===
+	// Mappa: pipelineName -> reservation
+	inFlightReservations map[string]*InFlightReservation
+	reservationsMutex    sync.RWMutex
 
 	stopChan chan struct{}
 	stopWg   sync.WaitGroup
@@ -49,17 +87,21 @@ func NewRealMetricsCollector(clients map[string]client.Client, config *Config) *
 	}
 
 	return &RealMetricsCollector{
-		config:   config,
-		clients:  clients,
-		cache:    placement.NewClusterMetrics(),
-		stopChan: make(chan struct{}),
+		config:               config,
+		clients:              clients,
+		cache:                placement.NewClusterMetrics(),
+		inFlightReservations: make(map[string]*InFlightReservation),
+		stopChan:             make(chan struct{}),
 	}
 }
 
 // Start avvia il refresh periodico delle metriche in background.
 func (c *RealMetricsCollector) Start(ctx context.Context) {
 	logger := log.FromContext(ctx)
-	logger.Info("[METRICS] Starting collector", "refreshInterval", c.config.RefreshInterval, "clusters", len(c.clients))
+	logger.Info("[METRICS] Starting collector",
+		"refreshInterval", c.config.RefreshInterval,
+		"clusters", len(c.clients),
+		"reservationTTL", defaultReservationTTL)
 
 	// Primo refresh sincrono
 	if err := c.refresh(ctx); err != nil {
@@ -69,6 +111,10 @@ func (c *RealMetricsCollector) Start(ctx context.Context) {
 	// Avvia background refresh
 	c.stopWg.Add(1)
 	go c.backgroundRefresh(ctx)
+
+	// Avvia cleanup periodico delle reservation scadute
+	c.stopWg.Add(1)
+	go c.reservationCleanupLoop(ctx)
 }
 
 // Stop ferma il refresh in background.
@@ -77,18 +123,291 @@ func (c *RealMetricsCollector) Stop() {
 	c.stopWg.Wait()
 }
 
-// CollectMetrics ritorna le metriche correnti dalla cache.
+// =============================================================================
+// IN-FLIGHT RESERVATIONS - PUBLIC API
+// =============================================================================
+
+// AddReservation registra una reservation per una pipeline appena schedulata.
+//
+// QUANDO CHIAMARLA: Subito dopo che il modello RL decide il cluster target,
+// PRIMA che i Pod vengano creati su Kubeflow.
+//
+// PERCHÉ: Previene l'over-commit. Le prossime decisioni vedranno queste risorse
+// come già utilizzate, anche se i Pod non sono ancora visibili in K8s.
+//
+// Esempio di utilizzo nel controller:
+//
+//	targetCluster, decision, err := strategy.SelectCluster(...)
+//	if err == nil {
+//	    metricsCollector.AddReservation(ppr.Name, targetCluster, totalResources.TotalCPU, totalResources.TotalMemory)
+//	}
+func (c *RealMetricsCollector) AddReservation(pipelineName, clusterName string, cpuMillicores, memoryBytes int64) {
+	c.reservationsMutex.Lock()
+	defer c.reservationsMutex.Unlock()
+
+	now := time.Now()
+	reservation := &InFlightReservation{
+		PipelineName: pipelineName,
+		ClusterName:  clusterName,
+		CPURequested: cpuMillicores,
+		MemRequested: memoryBytes,
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(defaultReservationTTL),
+	}
+
+	c.inFlightReservations[pipelineName] = reservation
+
+	// Log per debugging/monitoring
+	log.Log.Info("[RESERVATION] Added",
+		"pipeline", pipelineName,
+		"cluster", clusterName,
+		"cpu", fmt.Sprintf("%dm", cpuMillicores),
+		"memory", fmt.Sprintf("%dMB", memoryBytes/(1024*1024)),
+		"expiresIn", defaultReservationTTL.String(),
+		"totalActiveReservations", len(c.inFlightReservations))
+}
+
+// RemoveReservation rimuove una reservation.
+//
+// QUANDO CHIAMARLA:
+// - Quando i Pod diventano visibili nelle metriche K8s
+// - Quando la pipeline fallisce o viene cancellata
+// - Quando la pipeline completa l'esecuzione
+//
+// NOTA: Le reservation scadono automaticamente dopo defaultReservationTTL,
+// quindi chiamare RemoveReservation è opzionale ma consigliato per
+// liberare risorse appena possibile.
+func (c *RealMetricsCollector) RemoveReservation(pipelineName string) {
+	c.reservationsMutex.Lock()
+	defer c.reservationsMutex.Unlock()
+
+	if res, exists := c.inFlightReservations[pipelineName]; exists {
+		age := time.Since(res.CreatedAt)
+		delete(c.inFlightReservations, pipelineName)
+
+		log.Log.Info("[RESERVATION] Removed",
+			"pipeline", pipelineName,
+			"cluster", res.ClusterName,
+			"age", age.String(),
+			"remainingReservations", len(c.inFlightReservations))
+	}
+}
+
+// GetReservationsForCluster ritorna le risorse totali riservate per un cluster.
+// Utile per debugging/monitoring.
+func (c *RealMetricsCollector) GetReservationsForCluster(clusterName string) (cpuMillicores, memoryBytes int64) {
+	c.reservationsMutex.RLock()
+	defer c.reservationsMutex.RUnlock()
+
+	now := time.Now()
+	for _, res := range c.inFlightReservations {
+		if now.After(res.ExpiresAt) {
+			continue // Scaduta, ignora
+		}
+		if res.ClusterName == clusterName {
+			cpuMillicores += res.CPURequested
+			memoryBytes += res.MemRequested
+		}
+	}
+	return
+}
+
+// GetActiveReservationsCount ritorna il numero di reservation attive (non scadute).
+func (c *RealMetricsCollector) GetActiveReservationsCount() int {
+	c.reservationsMutex.RLock()
+	defer c.reservationsMutex.RUnlock()
+
+	count := 0
+	now := time.Now()
+	for _, res := range c.inFlightReservations {
+		if now.Before(res.ExpiresAt) {
+			count++
+		}
+	}
+	return count
+}
+
+// =============================================================================
+// IN-FLIGHT RESERVATIONS - INTERNAL
+// =============================================================================
+
+// reservationCleanupLoop pulisce periodicamente le reservation scadute.
+func (c *RealMetricsCollector) reservationCleanupLoop(ctx context.Context) {
+	defer c.stopWg.Done()
+
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.cleanupExpiredReservations()
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// cleanupExpiredReservations rimuove le reservation scadute.
+func (c *RealMetricsCollector) cleanupExpiredReservations() {
+	c.reservationsMutex.Lock()
+	defer c.reservationsMutex.Unlock()
+
+	now := time.Now()
+	expired := 0
+
+	for name, res := range c.inFlightReservations {
+		if now.After(res.ExpiresAt) {
+			delete(c.inFlightReservations, name)
+			expired++
+
+			log.Log.Info("[RESERVATION] Expired and auto-removed",
+				"pipeline", name,
+				"cluster", res.ClusterName,
+				"totalAge", now.Sub(res.CreatedAt).String())
+		}
+	}
+
+	if expired > 0 {
+		log.Log.Info("[RESERVATION] Cleanup completed",
+			"expiredCount", expired,
+			"remainingCount", len(c.inFlightReservations))
+	}
+}
+
+// =============================================================================
+// METRICS COLLECTION
+// =============================================================================
+
+// CollectMetrics ritorna le metriche correnti dalla cache (SENZA reservation).
+// Per le decisioni di placement, usare GetAdjustedMetrics() che include le reservation.
 func (c *RealMetricsCollector) CollectMetrics(ctx context.Context) (*placement.ClusterMetrics, error) {
 	c.cacheMutex.RLock()
 	defer c.cacheMutex.RUnlock()
 
 	cacheAge := time.Since(c.cacheTimestamp)
+
+	// Log per debugging
+	logger := log.FromContext(ctx)
+	logger.Info("[METRICS CACHE]",
+		"age", cacheAge.String(),
+		"ttl", c.config.CacheTTL.String(),
+		"isExpired", cacheAge > c.config.CacheTTL,
+		"activeReservations", c.GetActiveReservationsCount())
+
 	if cacheAge > c.config.CacheTTL {
 		return nil, fmt.Errorf("metrics cache expired (age: %v, TTL: %v)", cacheAge, c.config.CacheTTL)
 	}
 
 	return c.cache, nil
 }
+
+// GetAdjustedMetrics ritorna le metriche CON le reservation in-flight sottratte.
+//
+// QUESTA È LA FUNZIONE DA USARE PER LE DECISIONI DI PLACEMENT!
+//
+// Le metriche ritornate hanno già le risorse delle pipeline "in-flight"
+// sottratte, quindi l'agente RL vede lo stato "reale" del cluster
+// includendo le pipeline già schedulate ma non ancora visibili in K8s.
+func (c *RealMetricsCollector) GetAdjustedMetrics(ctx context.Context) (*placement.ClusterMetrics, error) {
+	// Prima ottieni le metriche raw dalla cache
+	rawMetrics, err := c.CollectMetrics(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Crea una copia profonda per non modificare la cache originale
+	adjustedMetrics := placement.NewClusterMetrics()
+
+	c.reservationsMutex.RLock()
+	defer c.reservationsMutex.RUnlock()
+
+	now := time.Now()
+	logger := log.FromContext(ctx)
+
+	// Copia ogni cluster e sottrai le reservation attive
+	for clusterName, rawMetric := range rawMetrics.Clusters {
+		// Copia tutti i campi del metric
+		adjustedMetric := &placement.ClusterMetric{
+			Name:            rawMetric.Name,
+			CPUCapacity:     rawMetric.CPUCapacity,
+			CPUUsed:         rawMetric.CPUUsed,
+			CPUAvailable:    rawMetric.CPUAvailable,
+			MemoryCapacity:  rawMetric.MemoryCapacity,
+			MemoryUsed:      rawMetric.MemoryUsed,
+			MemoryAvailable: rawMetric.MemoryAvailable,
+			Available:       rawMetric.Available,
+			LatencyToCloud:  rawMetric.LatencyToCloud,
+			LatencyToEdge1:  rawMetric.LatencyToEdge1,
+			LatencyToEdge2:  rawMetric.LatencyToEdge2,
+			LatencyToEdge3:  rawMetric.LatencyToEdge3,
+		}
+
+		// Calcola reservation totali per questo cluster
+		var reservedCPU, reservedMem int64
+		var reservationCount int
+		var reservationPipelines []string
+
+		for pipelineName, res := range c.inFlightReservations {
+			if now.After(res.ExpiresAt) {
+				continue // Scaduta, ignora
+			}
+			if res.ClusterName == clusterName {
+				reservedCPU += res.CPURequested
+				reservedMem += res.MemRequested
+				reservationCount++
+				reservationPipelines = append(reservationPipelines, pipelineName)
+			}
+		}
+
+		// Sottrai le reservation dalle risorse disponibili
+		if reservedCPU > 0 || reservedMem > 0 {
+			adjustedMetric.CPUAvailable -= reservedCPU
+			adjustedMetric.MemoryAvailable -= reservedMem
+			adjustedMetric.CPUUsed += reservedCPU
+			adjustedMetric.MemoryUsed += reservedMem
+
+			// Assicura che non vadano sotto zero
+			if adjustedMetric.CPUAvailable < 0 {
+				adjustedMetric.CPUAvailable = 0
+			}
+			if adjustedMetric.MemoryAvailable < 0 {
+				adjustedMetric.MemoryAvailable = 0
+			}
+
+			logger.Info("[METRICS] Adjusted for in-flight reservations",
+				"cluster", clusterName,
+				"reservationCount", reservationCount,
+				"reservedCPU", fmt.Sprintf("%dm", reservedCPU),
+				"reservedMem", fmt.Sprintf("%dMB", reservedMem/(1024*1024)),
+				"pipelines", reservationPipelines,
+				"rawCPUAvailable", fmt.Sprintf("%dm", rawMetric.CPUAvailable),
+				"adjustedCPUAvailable", fmt.Sprintf("%dm", adjustedMetric.CPUAvailable))
+		}
+
+		adjustedMetrics.SetCluster(clusterName, adjustedMetric)
+	}
+
+	return adjustedMetrics, nil
+}
+
+// GetCacheTimestamp ritorna il timestamp dell'ultima raccolta metriche.
+func (c *RealMetricsCollector) GetCacheTimestamp() time.Time {
+	c.cacheMutex.RLock()
+	defer c.cacheMutex.RUnlock()
+	return c.cacheTimestamp
+}
+
+// GetMetricsAge ritorna l'età delle metriche in secondi.
+func (c *RealMetricsCollector) GetMetricsAge() float64 {
+	c.cacheMutex.RLock()
+	defer c.cacheMutex.RUnlock()
+	return time.Since(c.cacheTimestamp).Seconds()
+}
+
+// =============================================================================
+// BACKGROUND REFRESH
+// =============================================================================
 
 // backgroundRefresh loop infinito per aggiornamento periodico metriche.
 func (c *RealMetricsCollector) backgroundRefresh(ctx context.Context) {
@@ -120,7 +439,7 @@ func (c *RealMetricsCollector) refresh(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
 
-	// Raccolta parallela
+	// Raccolta parallela da tutti i cluster
 	for clusterName, clusterClient := range c.clients {
 		wg.Add(1)
 		go func(name string, cli client.Client) {
@@ -149,7 +468,10 @@ func (c *RealMetricsCollector) refresh(ctx context.Context) error {
 	c.cacheTimestamp = time.Now()
 	c.cacheMutex.Unlock()
 
-	logger.Info("[METRICS] Refreshed", "clusters", len(newMetrics.Clusters), "timestamp", c.cacheTimestamp.Format("15:04:05"))
+	logger.Info("[METRICS] Refreshed",
+		"clusters", len(newMetrics.Clusters),
+		"timestamp", c.cacheTimestamp.Format("15:04:05"),
+		"activeReservations", c.GetActiveReservationsCount())
 
 	return nil
 }
@@ -170,7 +492,7 @@ func (c *RealMetricsCollector) collectClusterMetrics(ctx context.Context, cluste
 		return nil, fmt.Errorf("no nodes found")
 	}
 
-	// Calcola capacità totale (inline)
+	// Calcola capacità totale
 	var totalCPUCapacity, totalMemoryCapacity int64
 	for _, node := range nodeList.Items {
 		cpuCap := node.Status.Capacity[corev1.ResourceCPU]
@@ -185,7 +507,7 @@ func (c *RealMetricsCollector) collectClusterMetrics(ctx context.Context, cluste
 		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	// Calcola requests totali (inline, solo pod attivi)
+	// Calcola requests totali (solo pod attivi)
 	var totalCPURequested, totalMemoryRequested int64
 	for _, pod := range podList.Items {
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
@@ -270,11 +592,8 @@ func (c *RealMetricsCollector) measureLatencies(ctx context.Context, metrics *pl
 
 			latency := c.measureLatency(ctx, toClient)
 
-			// --- AGGIUNGI QUESTA RIGA ---
 			logger.Info("[LATENCY CHECK]", "From", fromCluster, "To", toCluster, "Latency(ms)", latency)
-			// -----------------------------
 
-			// Imposta il campo latenza appropriato (inline switch)
 			switch toCluster {
 			case edgeCluster1:
 				fromMetric.LatencyToEdge1 = latency
@@ -298,7 +617,6 @@ func (c *RealMetricsCollector) measureLatency(ctx context.Context, cli client.Cl
 
 	start := time.Now()
 
-	// Query leggera all'API server
 	namespace := &corev1.Namespace{}
 	err := cli.Get(timeoutCtx, client.ObjectKey{Name: kubeSystemNS}, namespace)
 

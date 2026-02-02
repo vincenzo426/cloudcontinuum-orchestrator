@@ -62,6 +62,11 @@ type PipelinePlacementRequestReconciler struct {
 	pipelineParser     *pipeline.Parser
 	kubeflowManager    *kubeflow.Manager
 	transferCalculator *datatransfer.Calculator
+
+	// === RESERVATION SUPPORT ===
+	// Riferimento diretto al RealMetricsCollector per accedere ai metodi di reservation.
+	// Questo è necessario perché l'interfaccia Collector non include i metodi di reservation.
+	realMetricsCollector *metrics.RealMetricsCollector
 }
 
 // RBAC permissions
@@ -100,7 +105,7 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 
 	logger.Info("[PARSE] Pipeline parsed", "name", pipelineIR.PipelineInfo.Name, "executors", len(pipelineIR.DeploymentSpec.Executors))
 
-	// Decisione placement
+	// Decisione placement (con metriche adjusted per reservation)
 	targetCluster, decision, resources, transferInfo, err := r.makePlacementDecision(ctx, ppr, pipelineIR)
 	if err != nil {
 		return r.failWithStatus(ctx, ppr, err, decision, requeueDelayShort)
@@ -108,9 +113,16 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 
 	logger.Info("[PLACEMENT] Decision made", "strategy", ppr.Spec.PlacementStrategy, "cluster", targetCluster)
 
+	// === AGGIUNGI RESERVATION DOPO DECISIONE RIUSCITA ===
+	// Registra le risorse come "in-flight" per evitare over-commit
+	// sulle prossime decisioni mentre i Pod non sono ancora visibili in K8s.
+	r.addReservationForPipeline(ppr.Name, targetCluster, resources)
+
 	// Esecuzione pipeline
 	runID, runURL, err := r.executePipeline(ctx, ppr, pipelineIR, targetCluster, pipelineYAML)
 	if err != nil {
+		// Se l'esecuzione fallisce, rimuovi la reservation
+		r.removeReservationForPipeline(ppr.Name)
 		return r.failWithStatus(ctx, ppr, err, "Pipeline execution failed", requeueDelayLong)
 	}
 
@@ -119,6 +131,37 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 	// Update status finale
 	return r.updateStatusAndComplete(ctx, ppr, targetCluster, decision, resources, transferInfo, runID, runURL, true, "")
 }
+
+// =============================================================================
+// RESERVATION HELPERS
+// =============================================================================
+
+// addReservationForPipeline aggiunge una reservation per prevenire over-commit.
+func (r *PipelinePlacementRequestReconciler) addReservationForPipeline(pipelineName, targetCluster string, resources *orchestratorv1alpha1.PipelineResourcesSummary) {
+	if r.realMetricsCollector == nil || resources == nil {
+		return
+	}
+
+	r.realMetricsCollector.AddReservation(
+		pipelineName,
+		targetCluster,
+		resources.TotalCPU,
+		resources.TotalMemory,
+	)
+}
+
+// removeReservationForPipeline rimuove una reservation (chiamata su fallimento).
+func (r *PipelinePlacementRequestReconciler) removeReservationForPipeline(pipelineName string) {
+	if r.realMetricsCollector == nil {
+		return
+	}
+
+	r.realMetricsCollector.RemoveReservation(pipelineName)
+}
+
+// =============================================================================
+// PLACEMENT DECISION
+// =============================================================================
 
 // fetchAndParsePipeline recupera e parsifica il YAML della pipeline.
 func (r *PipelinePlacementRequestReconciler) fetchAndParsePipeline(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest) (*pipeline.PipelineIR, string, error) {
@@ -159,13 +202,18 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 ) (string, string, *orchestratorv1alpha1.PipelineResourcesSummary, *datatransfer.TransferInfo, error) {
 	logger := log.FromContext(ctx)
 
-	// Raccolta metriche
-	clusterMetrics, err := r.collectMetrics(ctx)
+	// === RACCOLTA METRICHE CON RESERVATION ===
+	// Usa GetAdjustedMetrics se disponibile (include le reservation in-flight),
+	// altrimenti fallback a CollectMetrics standard.
+	clusterMetrics, metricsAge, err := r.collectMetricsWithReservation(ctx)
 	if err != nil {
 		return "", "", nil, nil, err
 	}
 
-	logger.V(1).Info("[METRICS] Collected", "clusters", len(clusterMetrics.Clusters))
+	logger.Info("[METRICS] Collected",
+		"clusters", len(clusterMetrics.Clusters),
+		"metricsAge", fmt.Sprintf("%.2fs", metricsAge),
+		"activeReservations", r.getActiveReservationsCount())
 
 	// Selezione strategia
 	strategy, ok := r.pipelineStrategies[ppr.Spec.PlacementStrategy]
@@ -182,7 +230,7 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 	// Calcolo risorse
 	totalResources := pipeline.CalculatePipelineResources(pipelineIR, r.pipelineParser)
 
-	// 5. Calcolo trasferimento dati (UNIFORMEMENTE per tutte le strategie!)
+	// Calcolo trasferimento dati (UNIFORMEMENTE per tutte le strategie!)
 	transferInfo := r.calculateDataTransfer(
 		ppr.Spec.DataLocation,
 		targetCluster,
@@ -190,21 +238,70 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 		clusterMetrics,
 	)
 
-	// Log summary dettagliato (usa NewPipelinePlacement e Summary)
+	// Log summary dettagliato con metricsAge
 	placementResult := pipeline.NewPipelinePlacement(targetCluster, decision, totalResources)
 	logger.Info("[PLACEMENT] Complete",
 		"cluster", targetCluster,
 		"strategy", ppr.Spec.PlacementStrategy,
+		"metricsAge", fmt.Sprintf("%.2fs", metricsAge),
 		"transferTime", fmt.Sprintf("%dms", transferInfo.TransferTime),
 		"executors", totalResources.ExecutorCount,
-		"cpuCores", fmt.Sprintf("%.2f", float64(totalResources.TotalCPU)/1000.0))
+		"cpuCores", fmt.Sprintf("%.2f", float64(totalResources.TotalCPU)/1000.0),
+		"memoryGB", fmt.Sprintf("%.2f", float64(totalResources.TotalMemory)/(1024*1024*1024)))
 	logger.V(1).Info("[DEBUG] Placement details\n" + placementResult.Summary())
 	if transferInfo.TransferTime > 0 {
 		logger.Info("[DATA TRANSFER]", "details", transferInfo.TransferDetails)
 	}
+
 	// Converti per CRD
 	return targetCluster, decision, r.toResourcesSummary(totalResources), transferInfo, nil
 }
+
+// collectMetricsWithReservation raccoglie metriche preferendo quelle adjusted (con reservation).
+// Ritorna anche l'età delle metriche per logging.
+func (r *PipelinePlacementRequestReconciler) collectMetricsWithReservation(ctx context.Context) (*placement.ClusterMetrics, float64, error) {
+	logger := log.FromContext(ctx)
+
+	var metricsAge float64 = 0.0
+
+	// Se abbiamo il RealMetricsCollector, usa GetAdjustedMetrics e GetMetricsAge
+	if r.realMetricsCollector != nil {
+		metricsAge = r.realMetricsCollector.GetMetricsAge()
+
+		adjustedMetrics, err := r.realMetricsCollector.GetAdjustedMetrics(ctx)
+		if err != nil {
+			logger.Error(err, "[WARN] Failed to get adjusted metrics, using fallback")
+			//return r.mockMetrics(), metricsAge, nil
+		}
+
+		logger.V(1).Info("[METRICS] Using adjusted metrics (with reservations)",
+			"metricsAge", fmt.Sprintf("%.2fs", metricsAge))
+
+		return adjustedMetrics, metricsAge, nil
+	}
+
+	// Fallback: usa l'interfaccia Collector standard
+	metrics, err := r.MetricsCollector.CollectMetrics(ctx)
+	if err != nil {
+		logger.Error(err, "[WARN] Using fallback metrics")
+		//return r.mockMetrics(), metricsAge, nil
+	}
+
+	logger.V(1).Info("[METRICS] Real metrics collected (no reservation support)")
+	return metrics, metricsAge, nil
+}
+
+// getActiveReservationsCount ritorna il numero di reservation attive.
+func (r *PipelinePlacementRequestReconciler) getActiveReservationsCount() int {
+	if r.realMetricsCollector != nil {
+		return r.realMetricsCollector.GetActiveReservationsCount()
+	}
+	return 0
+}
+
+// =============================================================================
+// PIPELINE EXECUTION
+// =============================================================================
 
 // executePipeline esegue la pipeline sul cluster target.
 func (r *PipelinePlacementRequestReconciler) executePipeline(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, pipelineIR *pipeline.PipelineIR, targetCluster, pipelineYAML string) (string, string, error) {
@@ -225,6 +322,10 @@ func (r *PipelinePlacementRequestReconciler) executePipeline(ctx context.Context
 		ppr.Spec.ExperimentId, ppr.Spec.ExperimentName, params,
 	)
 }
+
+// =============================================================================
+// YAML FETCHING
+// =============================================================================
 
 // fetchPipelineYAML recupera il YAML della pipeline dalla sorgente configurata.
 func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest) (string, error) {
@@ -295,19 +396,9 @@ func (r *PipelinePlacementRequestReconciler) fetchFromConfigMap(ctx context.Cont
 	return content, nil
 }
 
-// collectMetrics raccoglie metriche dai cluster.
-func (r *PipelinePlacementRequestReconciler) collectMetrics(ctx context.Context) (*placement.ClusterMetrics, error) {
-	logger := log.FromContext(ctx)
-
-	metrics, err := r.MetricsCollector.CollectMetrics(ctx)
-	if err != nil {
-		logger.Error(err, "[WARN] Using fallback metrics")
-		return r.mockMetrics(), nil
-	}
-
-	logger.V(1).Info("[METRICS] Real metrics collected", "clusters", len(metrics.Clusters))
-	return metrics, nil
-}
+// =============================================================================
+// FALLBACK METRICS
+// =============================================================================
 
 // mockMetrics fornisce metriche di fallback.
 func (r *PipelinePlacementRequestReconciler) mockMetrics() *placement.ClusterMetrics {
@@ -326,6 +417,10 @@ func (r *PipelinePlacementRequestReconciler) mockMetrics() *placement.ClusterMet
 	})
 	return metrics
 }
+
+// =============================================================================
+// STATUS UPDATES
+// =============================================================================
 
 // failWithStatus gestisce errori aggiornando lo status.
 func (r *PipelinePlacementRequestReconciler) failWithStatus(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, err error, decision string, requeueAfter time.Duration) (ctrl.Result, error) {
@@ -397,13 +492,19 @@ func (r *PipelinePlacementRequestReconciler) updateStatusAndComplete(ctx context
 	}
 
 	if success {
-		log.FromContext(ctx).Info("[SUCCESS] Reconciled", "cluster", targetCluster, "runID", runID, "transferTime", fmt.Sprintf("%dms", transferInfo.TransferTime))
+		log.FromContext(ctx).Info("[SUCCESS] Reconciled",
+			"cluster", targetCluster,
+			"runID", runID,
+			"transferTime", fmt.Sprintf("%dms", transferInfo.TransferTime),
+			"activeReservations", r.getActiveReservationsCount())
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// Helper functions
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
 
 func (r *PipelinePlacementRequestReconciler) sourceType(ppr *orchestratorv1alpha1.PipelinePlacementRequest) string {
 	source := ppr.Spec.PipelineSource
@@ -500,6 +601,10 @@ func (r *PipelinePlacementRequestReconciler) getNetworkLatency(
 	}
 }
 
+// =============================================================================
+// SETUP
+// =============================================================================
+
 // SetupWithManager configura il controller.
 func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.pipelineParser = pipeline.NewParser()
@@ -526,8 +631,10 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	}
 	r.ClusterManager = clusterManager
 
+	// === CREA METRICS COLLECTOR CON SUPPORTO RESERVATION ===
 	metricsCollector := metrics.NewRealMetricsCollector(clusterManager.ClusterClients, metrics.DefaultConfig())
 	r.MetricsCollector = metricsCollector
+	r.realMetricsCollector = metricsCollector // Salva riferimento diretto per reservation
 	metricsCollector.Start(ctx)
 
 	// Kubeflow Manager
@@ -537,7 +644,10 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	}
 	r.kubeflowManager = kubeflowMgr
 
-	ctrl.Log.Info("[INIT] PipelinePlacementRequest controller initialized", "clusters", clusterManager.ListClusters(), "strategies", len(r.pipelineStrategies))
+	ctrl.Log.Info("[INIT] PipelinePlacementRequest controller initialized",
+		"clusters", clusterManager.ListClusters(),
+		"strategies", len(r.pipelineStrategies),
+		"reservationSupport", true)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&orchestratorv1alpha1.PipelinePlacementRequest{}).
