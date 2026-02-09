@@ -146,7 +146,22 @@ class RLPlacementAgent:
         
         obs.append(cloud_headroom)
         obs.append(np.mean(edge_utils) if edge_utils else 0.0)
-        obs.append(0.0)  # variance placeholder
+        # Calcola l'utilizzo di ogni cluster
+        all_utils = []
+        edge_utils = []
+        for c in self.clusters:
+            if c.name in clusters_state:
+                s = clusters_state[c.name]
+                cpu_util = 1.0 - (s.get('cpu_available', 0) / max(s.get('cpu_capacity', 1), 1))
+                mem_util = 1.0 - (s.get('memory_available', 0) / max(s.get('memory_capacity', 1), 1))
+                avg_util = (cpu_util + mem_util) / 2.0
+                all_utils.append(avg_util)
+                if c.cluster_type == "edge":
+                    edge_utils.append(avg_util)
+
+        # [27] Varianza normalizzata
+        util_variance = np.var(all_utils) if all_utils else 0.0
+        obs.append(min(util_variance * 10, 1.0))
         obs.append(1.0)  # single pipeline
         
         return np.array(obs, dtype=np.float32).reshape(1, -1)
