@@ -47,74 +47,48 @@ USAGE IN CODE:
 __version__ = "4.0.0"
 __author__ = "CloudContinuum Team"
 
-# =============================================================================
-# CONFIG EXPORTS
-# =============================================================================
+# internal/rl/__init__.py
+"""CloudContinuum RL - Reinforcement Learning for adaptive pipeline placement."""
 
 from .config import (
-    # Dataclasses
     ClusterConfig,
     EnvironmentConfig,
-    
-    # Constants
+    PipelineSizeCategory,
     DEFAULT_CLUSTERS,
     DEFAULT_CONFIG,
     PIPELINE_TEMPLATES,
-    
-    # Utilities
-    PipelineSizeCategory,
     get_config_for_difficulty,
+    MB, GB,  # Data size constants
 )
-
-# =============================================================================
-# SIMULATOR EXPORTS
-# =============================================================================
-
 from .simulator import (
     NetworkLatencyModel,
     ExecutionTimeSimulator,
     ResourceContentionModel,
     SimulatedClusterState,
+    estimate_optimal_cluster,
 )
-
-# =============================================================================
-# ENVIRONMENT EXPORTS
-# =============================================================================
-
 from .environment import CloudContinuumEnv
-
-# =============================================================================
-# INFERENCE EXPORTS
-# =============================================================================
-
-from .inference import RLPlacementAgent
-
-# =============================================================================
-# ALL EXPORTS
-# =============================================================================
+from .inference import RLPlacementAgent, run_server
 
 __all__ = [
-    # Version
-    "__version__",
-    
     # Config
     "ClusterConfig",
-    "EnvironmentConfig",
+    "EnvironmentConfig", 
+    "PipelineSizeCategory",
     "DEFAULT_CLUSTERS",
     "DEFAULT_CONFIG",
     "PIPELINE_TEMPLATES",
-    "PipelineSizeCategory",
     "get_config_for_difficulty",
-    
+    "MB", "GB",
     # Simulator
     "NetworkLatencyModel",
     "ExecutionTimeSimulator",
     "ResourceContentionModel",
     "SimulatedClusterState",
-    
+    "estimate_optimal_cluster",
     # Environment
     "CloudContinuumEnv",
-    
     # Inference
     "RLPlacementAgent",
+    "run_server",
 ]

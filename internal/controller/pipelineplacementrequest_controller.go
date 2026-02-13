@@ -40,7 +40,7 @@ import (
 	"github.com/vincenzo426/cloudcontinuum-orchestrator/internal/placement"
 )
 
-// Costanti di configurazione
+// Configuration constants
 const (
 	requeueDelayShort = 30 * time.Second
 	requeueDelayLong  = 60 * time.Second
@@ -52,7 +52,7 @@ const (
 	kubeflowNamespace       = "kubeflow"
 )
 
-// PipelinePlacementRequestReconciler gestisce il ciclo di vita delle PipelinePlacementRequest.
+// PipelinePlacementRequestReconciler manages the lifecycle of PipelinePlacementRequests.
 type PipelinePlacementRequestReconciler struct {
 	client.Client
 	Scheme             *runtime.Scheme
@@ -63,9 +63,7 @@ type PipelinePlacementRequestReconciler struct {
 	kubeflowManager    *kubeflow.Manager
 	transferCalculator *datatransfer.Calculator
 
-	// === RESERVATION SUPPORT ===
-	// Riferimento diretto al RealMetricsCollector per accedere ai metodi di reservation.
-	// Questo è necessario perché l'interfaccia Collector non include i metodi di reservation.
+	// Reference to RealMetricsCollector for reservation support
 	realMetricsCollector *metrics.RealMetricsCollector
 }
 
@@ -76,12 +74,12 @@ type PipelinePlacementRequestReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
-// Reconcile gestisce il ciclo di vita delle PipelinePlacementRequest.
+// Reconcile handles the lifecycle of PipelinePlacementRequests.
 func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("[RECONCILE] Started", "name", req.Name, "namespace", req.Namespace)
 
-	// Fetch risorsa
+	// Fetch resource
 	ppr := &orchestratorv1alpha1.PipelinePlacementRequest{}
 	if err := r.Get(ctx, req.NamespacedName, ppr); err != nil {
 		if errors.IsNotFound(err) {
@@ -91,13 +89,13 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 		return ctrl.Result{}, err
 	}
 
-	// Verifica idempotenza
+	// Check idempotency
 	if ppr.Status.TargetCluster != "" {
 		logger.Info("[RECONCILE] Already processed", "cluster", ppr.Status.TargetCluster)
 		return ctrl.Result{}, nil
 	}
 
-	// Fetch e parse pipeline
+	// Fetch and parse pipeline
 	pipelineIR, pipelineYAML, err := r.fetchAndParsePipeline(ctx, ppr)
 	if err != nil {
 		return r.failWithStatus(ctx, ppr, err, "Pipeline fetch/parse failed", requeueDelayShort)
@@ -105,7 +103,7 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 
 	logger.Info("[PARSE] Pipeline parsed", "name", pipelineIR.PipelineInfo.Name, "executors", len(pipelineIR.DeploymentSpec.Executors))
 
-	// Decisione placement (con metriche adjusted per reservation)
+	// Placement decision (with adjusted metrics for reservation)
 	targetCluster, decision, resources, transferInfo, err := r.makePlacementDecision(ctx, ppr, pipelineIR)
 	if err != nil {
 		return r.failWithStatus(ctx, ppr, err, decision, requeueDelayShort)
@@ -113,22 +111,20 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 
 	logger.Info("[PLACEMENT] Decision made", "strategy", ppr.Spec.PlacementStrategy, "cluster", targetCluster)
 
-	// === AGGIUNGI RESERVATION DOPO DECISIONE RIUSCITA ===
-	// Registra le risorse come "in-flight" per evitare over-commit
-	// sulle prossime decisioni mentre i Pod non sono ancora visibili in K8s.
+	// Add reservation after successful decision
 	r.addReservationForPipeline(ppr.Name, targetCluster, resources)
 
-	// Esecuzione pipeline
+	// Execute pipeline
 	runID, runURL, err := r.executePipeline(ctx, ppr, pipelineIR, targetCluster, pipelineYAML)
 	if err != nil {
-		// Se l'esecuzione fallisce, rimuovi la reservation
+		// Remove reservation on failure
 		r.removeReservationForPipeline(ppr.Name)
 		return r.failWithStatus(ctx, ppr, err, "Pipeline execution failed", requeueDelayLong)
 	}
 
 	logger.Info("[SUCCESS] Pipeline deployed", "cluster", targetCluster, "runID", runID)
 
-	// Update status finale
+	// Update final status
 	return r.updateStatusAndComplete(ctx, ppr, targetCluster, decision, resources, transferInfo, runID, runURL, true, "")
 }
 
@@ -136,7 +132,6 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 // RESERVATION HELPERS
 // =============================================================================
 
-// addReservationForPipeline aggiunge una reservation per prevenire over-commit.
 func (r *PipelinePlacementRequestReconciler) addReservationForPipeline(pipelineName, targetCluster string, resources *orchestratorv1alpha1.PipelineResourcesSummary) {
 	if r.realMetricsCollector == nil || resources == nil {
 		return
@@ -150,12 +145,10 @@ func (r *PipelinePlacementRequestReconciler) addReservationForPipeline(pipelineN
 	)
 }
 
-// removeReservationForPipeline rimuove una reservation (chiamata su fallimento).
 func (r *PipelinePlacementRequestReconciler) removeReservationForPipeline(pipelineName string) {
 	if r.realMetricsCollector == nil {
 		return
 	}
-
 	r.realMetricsCollector.RemoveReservation(pipelineName)
 }
 
@@ -163,7 +156,6 @@ func (r *PipelinePlacementRequestReconciler) removeReservationForPipeline(pipeli
 // PLACEMENT DECISION
 // =============================================================================
 
-// fetchAndParsePipeline recupera e parsifica il YAML della pipeline.
 func (r *PipelinePlacementRequestReconciler) fetchAndParsePipeline(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest) (*pipeline.PipelineIR, string, error) {
 	logger := log.FromContext(ctx)
 
@@ -181,7 +173,7 @@ func (r *PipelinePlacementRequestReconciler) fetchAndParsePipeline(ctx context.C
 		return nil, "", fmt.Errorf("parse YAML: %w", err)
 	}
 
-	// Analizza struttura pipeline (usa funzioni non utilizzate)
+	// Analyze pipeline structure
 	executors := r.pipelineParser.GetExecutorNames(pipelineIR)
 	tasks := r.pipelineParser.GetTaskNames(pipelineIR)
 	dependencies := r.pipelineParser.GetTaskDependencies(pipelineIR)
@@ -194,7 +186,6 @@ func (r *PipelinePlacementRequestReconciler) fetchAndParsePipeline(ctx context.C
 	return pipelineIR, pipelineYAML, nil
 }
 
-// makePlacementDecision esegue la strategia di placement e calcola le risorse.
 func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 	ctx context.Context,
 	ppr *orchestratorv1alpha1.PipelinePlacementRequest,
@@ -202,9 +193,7 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 ) (string, string, *orchestratorv1alpha1.PipelineResourcesSummary, *datatransfer.TransferInfo, error) {
 	logger := log.FromContext(ctx)
 
-	// === RACCOLTA METRICHE CON RESERVATION ===
-	// Usa GetAdjustedMetrics se disponibile (include le reservation in-flight),
-	// altrimenti fallback a CollectMetrics standard.
+	// Collect metrics with reservation support
 	clusterMetrics, metricsAge, err := r.collectMetricsWithReservation(ctx)
 	if err != nil {
 		return "", "", nil, nil, err
@@ -215,22 +204,36 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 		"metricsAge", fmt.Sprintf("%.2fs", metricsAge),
 		"activeReservations", r.getActiveReservationsCount())
 
-	// Selezione strategia
+	// Select strategy
 	strategy, ok := r.pipelineStrategies[ppr.Spec.PlacementStrategy]
 	if !ok {
 		return "", "", nil, nil, fmt.Errorf("unknown placement strategy: %s", ppr.Spec.PlacementStrategy)
 	}
 
-	// Esecuzione placement
-	targetCluster, decision, err := strategy.SelectCluster(ctx, pipelineIR, ppr.Spec.DataLocation, clusterMetrics)
+	// Execute placement - use appropriate method based on strategy type
+	var targetCluster, decision string
+
+	// Check if this is the RL strategy (supports dataSize)
+	if rlStrategy, isRL := strategy.(*pipeline.RLPipelineStrategy); isRL {
+		// RL strategy: pass dataSize for transfer time consideration
+		targetCluster, decision, err = rlStrategy.SelectCluster(
+			ctx, pipelineIR, ppr.Spec.DataLocation, ppr.Spec.DataSize, clusterMetrics,
+		)
+	} else {
+		// Other strategies: use standard interface (no dataSize)
+		targetCluster, decision, err = strategy.SelectCluster(
+			ctx, pipelineIR, ppr.Spec.DataLocation, "", clusterMetrics,
+		)
+	}
+
 	if err != nil {
 		return "", decision, nil, nil, fmt.Errorf("cluster selection failed: %w", err)
 	}
 
-	// Calcolo risorse
+	// Calculate resources
 	totalResources := pipeline.CalculatePipelineResources(pipelineIR, r.pipelineParser)
 
-	// Calcolo trasferimento dati (UNIFORMEMENTE per tutte le strategie!)
+	// Calculate data transfer (uniform for all strategies)
 	transferInfo := r.calculateDataTransfer(
 		ppr.Spec.DataLocation,
 		targetCluster,
@@ -238,12 +241,13 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 		clusterMetrics,
 	)
 
-	// Log summary dettagliato con metricsAge
+	// Log detailed summary
 	placementResult := pipeline.NewPipelinePlacement(targetCluster, decision, totalResources)
 	logger.Info("[PLACEMENT] Complete",
 		"cluster", targetCluster,
 		"strategy", ppr.Spec.PlacementStrategy,
 		"metricsAge", fmt.Sprintf("%.2fs", metricsAge),
+		"dataSize", ppr.Spec.DataSize,
 		"transferTime", fmt.Sprintf("%dms", transferInfo.TransferTime),
 		"executors", totalResources.ExecutorCount,
 		"cpuCores", fmt.Sprintf("%.2f", float64(totalResources.TotalCPU)/1000.0),
@@ -253,25 +257,20 @@ func (r *PipelinePlacementRequestReconciler) makePlacementDecision(
 		logger.Info("[DATA TRANSFER]", "details", transferInfo.TransferDetails)
 	}
 
-	// Converti per CRD
 	return targetCluster, decision, r.toResourcesSummary(totalResources), transferInfo, nil
 }
 
-// collectMetricsWithReservation raccoglie metriche preferendo quelle adjusted (con reservation).
-// Ritorna anche l'età delle metriche per logging.
 func (r *PipelinePlacementRequestReconciler) collectMetricsWithReservation(ctx context.Context) (*placement.ClusterMetrics, float64, error) {
 	logger := log.FromContext(ctx)
 
 	var metricsAge float64 = 0.0
 
-	// Se abbiamo il RealMetricsCollector, usa GetAdjustedMetrics e GetMetricsAge
 	if r.realMetricsCollector != nil {
 		metricsAge = r.realMetricsCollector.GetMetricsAge()
 
 		adjustedMetrics, err := r.realMetricsCollector.GetAdjustedMetrics(ctx)
 		if err != nil {
 			logger.Error(err, "[WARN] Failed to get adjusted metrics, using fallback")
-			//return r.mockMetrics(), metricsAge, nil
 		}
 
 		logger.V(1).Info("[METRICS] Using adjusted metrics (with reservations)",
@@ -280,18 +279,16 @@ func (r *PipelinePlacementRequestReconciler) collectMetricsWithReservation(ctx c
 		return adjustedMetrics, metricsAge, nil
 	}
 
-	// Fallback: usa l'interfaccia Collector standard
+	// Fallback: use standard Collector interface
 	metrics, err := r.MetricsCollector.CollectMetrics(ctx)
 	if err != nil {
 		logger.Error(err, "[WARN] Using fallback metrics")
-		//return r.mockMetrics(), metricsAge, nil
 	}
 
 	logger.V(1).Info("[METRICS] Real metrics collected (no reservation support)")
 	return metrics, metricsAge, nil
 }
 
-// getActiveReservationsCount ritorna il numero di reservation attive.
 func (r *PipelinePlacementRequestReconciler) getActiveReservationsCount() int {
 	if r.realMetricsCollector != nil {
 		return r.realMetricsCollector.GetActiveReservationsCount()
@@ -303,14 +300,13 @@ func (r *PipelinePlacementRequestReconciler) getActiveReservationsCount() int {
 // PIPELINE EXECUTION
 // =============================================================================
 
-// executePipeline esegue la pipeline sul cluster target.
 func (r *PipelinePlacementRequestReconciler) executePipeline(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, pipelineIR *pipeline.PipelineIR, targetCluster, pipelineYAML string) (string, string, error) {
 	logger := log.FromContext(ctx)
 
 	runName := fmt.Sprintf("%s-%s", ppr.Name, time.Now().Format(runNameTimeFormat))
 	logger.Info("[EXECUTION] Triggering pipeline", "cluster", targetCluster, "pipeline", pipelineIR.PipelineInfo.Name)
 
-	// Conversione parametri
+	// Convert parameters
 	params := make(map[string]interface{})
 	for k, v := range ppr.Spec.Parameters {
 		params[k] = v
@@ -327,7 +323,6 @@ func (r *PipelinePlacementRequestReconciler) executePipeline(ctx context.Context
 // YAML FETCHING
 // =============================================================================
 
-// fetchPipelineYAML recupera il YAML della pipeline dalla sorgente configurata.
 func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest) (string, error) {
 	source := ppr.Spec.PipelineSource
 
@@ -346,98 +341,93 @@ func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(ctx context.Conte
 	return "", fmt.Errorf("no valid pipeline source specified")
 }
 
-// fetchFromURL scarica il contenuto YAML da un URL.
 func (r *PipelinePlacementRequestReconciler) fetchFromURL(ctx context.Context, url string) (string, error) {
-	httpCtx, cancel := context.WithTimeout(ctx, httpTimeout)
-	defer cancel()
+	client := &http.Client{Timeout: httpTimeout}
 
-	req, err := http.NewRequestWithContext(httpCtx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create HTTP request: %w", err)
+		return "", fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch URL: %w", err)
+		return "", fmt.Errorf("HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+		return "", fmt.Errorf("read body: %w", err)
 	}
 
 	return string(body), nil
 }
 
-// fetchFromConfigMap recupera il contenuto YAML da una ConfigMap.
 func (r *PipelinePlacementRequestReconciler) fetchFromConfigMap(ctx context.Context, namespace string, ref *orchestratorv1alpha1.ConfigMapReference) (string, error) {
-	logger := log.FromContext(ctx)
-
 	cm := &corev1.ConfigMap{}
-	if err := r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, cm); err != nil {
-		if errors.IsNotFound(err) {
-			return "", fmt.Errorf("configmap %s/%s not found", namespace, ref.Name)
-		}
-		return "", fmt.Errorf("failed to get configmap: %w", err)
+	key := client.ObjectKey{Namespace: namespace, Name: ref.Name}
+
+	if err := r.Get(ctx, key, cm); err != nil {
+		return "", fmt.Errorf("get configmap %s: %w", ref.Name, err)
 	}
 
-	content, ok := cm.Data[ref.Key]
+	data, ok := cm.Data[ref.Key]
 	if !ok {
-		return "", fmt.Errorf("key %s not found in configmap %s/%s", ref.Key, namespace, ref.Name)
+		return "", fmt.Errorf("key %s not found in configmap %s", ref.Key, ref.Name)
 	}
 
-	logger.V(1).Info("[DEBUG] Pipeline loaded from ConfigMap", "configmap", ref.Name, "key", ref.Key, "size", len(content))
-
-	return content, nil
-}
-
-// =============================================================================
-// FALLBACK METRICS
-// =============================================================================
-
-// mockMetrics fornisce metriche di fallback.
-func (r *PipelinePlacementRequestReconciler) mockMetrics() *placement.ClusterMetrics {
-	metrics := placement.NewClusterMetrics()
-	metrics.SetCluster("cloud_cluster", &placement.ClusterMetric{
-		Name: "cloud_cluster", CPUCapacity: 16000, CPUAvailable: 12000,
-		MemoryCapacity: 32 * 1024 * 1024 * 1024, MemoryAvailable: 24 * 1024 * 1024 * 1024, Available: true,
-	})
-	metrics.SetCluster("edge_cluster_1", &placement.ClusterMetric{
-		Name: "edge_cluster_1", CPUCapacity: 4000, CPUAvailable: 3000,
-		MemoryCapacity: 8 * 1024 * 1024 * 1024, MemoryAvailable: 6 * 1024 * 1024 * 1024, Available: true,
-	})
-	metrics.SetCluster("edge_cluster_2", &placement.ClusterMetric{
-		Name: "edge_cluster_2", CPUCapacity: 4000, CPUAvailable: 2500,
-		MemoryCapacity: 8 * 1024 * 1024 * 1024, MemoryAvailable: 5 * 1024 * 1024 * 1024, Available: true,
-	})
-	return metrics
+	return data, nil
 }
 
 // =============================================================================
 // STATUS UPDATES
 // =============================================================================
 
-// failWithStatus gestisce errori aggiornando lo status.
-func (r *PipelinePlacementRequestReconciler) failWithStatus(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, err error, decision string, requeueAfter time.Duration) (ctrl.Result, error) {
+func (r *PipelinePlacementRequestReconciler) failWithStatus(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, err error, message string, requeueAfter time.Duration) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Error(err, "[ERROR] Placement failed", "decision", decision)
 
-	// Combina il messaggio di errore con la decision per fornire dettagli completi
-	fullMessage := decision
-	if fullMessage == "" {
-		fullMessage = err.Error()
+	errorMsg := message
+	if err != nil {
+		errorMsg = fmt.Sprintf("%s: %v", message, err)
 	}
 
-	r.updateStatusAndComplete(ctx, ppr, "", decision, nil, nil, "", "", false, fullMessage)
+	logger.Error(err, "[FAILED]", "message", message)
+
+	// Update status with failure
+	now := metav1.Now()
+	ppr.Status.PlacementTime = &now
+
+	condition := metav1.Condition{
+		Type:               "Placed",
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: now,
+		Reason:             "PlacementFailed",
+		Message:            errorMsg,
+	}
+
+	updated := false
+	for i, cond := range ppr.Status.Conditions {
+		if cond.Type == "Placed" {
+			ppr.Status.Conditions[i] = condition
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		ppr.Status.Conditions = append(ppr.Status.Conditions, condition)
+	}
+
+	if statusErr := r.Status().Update(ctx, ppr); statusErr != nil {
+		logger.Error(statusErr, "Failed to update status")
+	}
+
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-// updateStatusAndComplete aggiorna lo status e completa la riconciliazione.
 func (r *PipelinePlacementRequestReconciler) updateStatusAndComplete(ctx context.Context, ppr *orchestratorv1alpha1.PipelinePlacementRequest, targetCluster, decision string, resources *orchestratorv1alpha1.PipelineResourcesSummary, transferInfo *datatransfer.TransferInfo, runID, runURL string, success bool, errorMsg string) (ctrl.Result, error) {
 	ppr.Status.TargetCluster = targetCluster
 	ppr.Status.PlacementDecision = decision
@@ -448,7 +438,7 @@ func (r *PipelinePlacementRequestReconciler) updateStatusAndComplete(ctx context
 	ppr.Status.ExperimentName = ppr.Spec.ExperimentName
 	ppr.Status.Parameters = ppr.Spec.Parameters
 
-	// Aggiungi informazioni trasferimento dati
+	// Add data transfer info
 	if transferInfo != nil {
 		ppr.Status.DataTransferLatency = transferInfo.NetworkLatency
 		ppr.Status.DataTransferTime = transferInfo.TransferTime
@@ -529,26 +519,25 @@ func (r *PipelinePlacementRequestReconciler) toResourcesSummary(res pipeline.Pip
 	}
 }
 
-// calculateDataTransfer - UNICA funzione per il calcolo trasferimento
 func (r *PipelinePlacementRequestReconciler) calculateDataTransfer(
 	dataLocation, targetCluster, dataSize string,
 	metrics *placement.ClusterMetrics,
 ) *datatransfer.TransferInfo {
 
-	// Caso 1: Nessun trasferimento necessario
+	// Case 1: No transfer needed
 	if dataLocation == "" || dataLocation == "none" || dataLocation == targetCluster {
 		return datatransfer.NoTransferNeeded()
 	}
 
-	// Caso 2: Usa dataSize di default se non specificato
+	// Case 2: Use default dataSize if not specified
 	if dataSize == "" {
 		dataSize = "1GB"
 	}
 
-	// Caso 3: Ottieni latenza di rete
+	// Case 3: Get network latency
 	networkLatency := r.getNetworkLatency(dataLocation, targetCluster, metrics)
 
-	// Caso 4: Calcola tempo totale trasferimento
+	// Case 4: Calculate total transfer time
 	if r.transferCalculator != nil {
 		result, err := r.transferCalculator.CalculateTransferTime(
 			dataLocation, targetCluster, dataSize, networkLatency,
@@ -565,7 +554,7 @@ func (r *PipelinePlacementRequestReconciler) calculateDataTransfer(
 		}
 	}
 
-	// Fallback: solo latenza di rete
+	// Fallback: network latency only
 	return &datatransfer.TransferInfo{
 		SourceCluster:  dataLocation,
 		TargetCluster:  targetCluster,
@@ -577,7 +566,6 @@ func (r *PipelinePlacementRequestReconciler) calculateDataTransfer(
 	}
 }
 
-// getNetworkLatency - helper
 func (r *PipelinePlacementRequestReconciler) getNetworkLatency(
 	source, target string,
 	metrics *placement.ClusterMetrics,
@@ -605,7 +593,6 @@ func (r *PipelinePlacementRequestReconciler) getNetworkLatency(
 // SETUP
 // =============================================================================
 
-// SetupWithManager configura il controller.
 func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.pipelineParser = pipeline.NewParser()
 
@@ -618,7 +605,7 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 
 	ctx := context.Background()
 
-	// Inizializza transfer calculator
+	// Initialize transfer calculator
 	transferCalc, err := datatransfer.NewCalculator(ctx, mgr.GetClient())
 	if err != nil {
 		ctrl.Log.Error(err, "Failed to initialize data transfer calculator")
@@ -631,10 +618,10 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	}
 	r.ClusterManager = clusterManager
 
-	// === CREA METRICS COLLECTOR CON SUPPORTO RESERVATION ===
+	// Create metrics collector with reservation support
 	metricsCollector := metrics.NewRealMetricsCollector(clusterManager.ClusterClients, metrics.DefaultConfig())
 	r.MetricsCollector = metricsCollector
-	r.realMetricsCollector = metricsCollector // Salva riferimento diretto per reservation
+	r.realMetricsCollector = metricsCollector
 	metricsCollector.Start(ctx)
 
 	// Kubeflow Manager

@@ -33,6 +33,7 @@ func (s *SimplePipelineHeuristicStrategy) SelectCluster(
 	ctx context.Context,
 	pipeline *PipelineIR,
 	dataLocation string,
+	dataSize string,
 	metrics *placement.ClusterMetrics,
 ) (string, string, error) {
 
@@ -40,7 +41,7 @@ func (s *SimplePipelineHeuristicStrategy) SelectCluster(
 
 	// Euristica 1: GPU → cloud obbligatorio
 	if totalResources.TotalGPU > 0 {
-		cluster, decision, err := s.cloudStrategy.SelectCluster(ctx, pipeline, dataLocation, metrics)
+		cluster, decision, err := s.cloudStrategy.SelectCluster(ctx, pipeline, dataLocation, "", metrics)
 		if err != nil {
 			return "", fmt.Sprintf("Simple-heuristic: Pipeline requires %d GPU but %s", totalResources.TotalGPU, err.Error()), err
 		}
@@ -51,7 +52,7 @@ func (s *SimplePipelineHeuristicStrategy) SelectCluster(
 
 	// Euristica 2: Pipeline pesante → preferisci cloud
 	if totalResources.TotalCPU > heavyPipelineThreshold {
-		cluster, decision, err := s.cloudStrategy.SelectCluster(ctx, pipeline, dataLocation, metrics)
+		cluster, decision, err := s.cloudStrategy.SelectCluster(ctx, pipeline, dataLocation, "", metrics)
 		if err == nil {
 			decision = fmt.Sprintf("Simple-heuristic: Heavy pipeline (%s), delegating to cloud-only. %s",
 				formatCPUCores(totalResources.TotalCPU), decision)
@@ -62,7 +63,7 @@ func (s *SimplePipelineHeuristicStrategy) SelectCluster(
 
 	// Euristica 3: Data locality per pipeline leggere
 	if dataLocation != "" && dataLocation != "none" {
-		cluster, decision, err := s.dataLocalityStrategy.SelectCluster(ctx, pipeline, dataLocation, metrics)
+		cluster, decision, err := s.dataLocalityStrategy.SelectCluster(ctx, pipeline, dataLocation, "", metrics)
 		if err == nil {
 			decision = fmt.Sprintf("Simple-heuristic: Light pipeline (%s), delegating to data-locality. %s",
 				formatCPUCores(totalResources.TotalCPU), decision)

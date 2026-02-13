@@ -29,6 +29,7 @@ func (s *DataLocalityPipelineStrategy) SelectCluster(
 	ctx context.Context,
 	pipeline *PipelineIR,
 	dataLocation string,
+	dataSize string,
 	metrics *placement.ClusterMetrics,
 ) (string, string, error) {
 

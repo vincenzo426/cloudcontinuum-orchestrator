@@ -82,7 +82,7 @@ func loadConfigFromConfigMap(ctx context.Context, k8sClient client.Client) (*Tra
 func getDefaultConfig() *TransferConfig {
 	return &TransferConfig{
 		bandwidthMatrix: map[string]float64{
-			// Cloud ↔ Edge: 100 Mbps
+			// Cloud ↔ Edge: 100 MB/s
 			"cloud_cluster-edge_cluster_1": 100,
 			"edge_cluster_1-cloud_cluster": 100,
 			"cloud_cluster-edge_cluster_2": 100,
@@ -90,13 +90,13 @@ func getDefaultConfig() *TransferConfig {
 			"cloud_cluster-edge_cluster_3": 100,
 			"edge_cluster_3-cloud_cluster": 100,
 
-			// Edge ↔ Edge: 1 Gbps
-			"edge_cluster_1-edge_cluster_2": 1000,
-			"edge_cluster_2-edge_cluster_1": 1000,
-			"edge_cluster_1-edge_cluster_3": 1000,
-			"edge_cluster_3-edge_cluster_1": 1000,
-			"edge_cluster_2-edge_cluster_3": 1000,
-			"edge_cluster_3-edge_cluster_2": 1000,
+			// Edge ↔ Edge: 50 MB/s
+			"edge_cluster_1-edge_cluster_2": 50,
+			"edge_cluster_2-edge_cluster_1": 50,
+			"edge_cluster_1-edge_cluster_3": 50,
+			"edge_cluster_3-edge_cluster_1": 50,
+			"edge_cluster_2-edge_cluster_3": 50,
+			"edge_cluster_3-edge_cluster_2": 50,
 		},
 		defaultBandwidth: defaultBandwidth,
 	}
@@ -137,11 +137,16 @@ func (c *Calculator) CalculateTransferTime(
 	// Get bandwidth for this route
 	bandwidth := c.getBandwidth(sourceCluster, targetCluster)
 
-	// Calculate transfer time
-	// Time (ms) = (DataSize in bytes * 8 bits/byte) / (Bandwidth in Mbps * 1,000,000 bits/sec) * 1000 ms/sec
-	dataSizeBits := float64(dataSizeBytes * 8)
-	bandwidthBitsPerSec := bandwidth * 1_000_000
-	transferTimeSeconds := dataSizeBits / bandwidthBitsPerSec
+	// Calculate transfer time con MB/s
+	// Time (ms) = (DataSize in bytes) / (Bandwidth in MB/s * 1,000,000 bytes/sec) * 1000 ms/sec
+	// 1. Non moltiplichiamo più per 8, restiamo in Byte
+	dataSizeBytesFloat := float64(dataSizeBytes)
+
+	// 2. Calcoliamo i Byte al secondo (1 MB = 1.000.000 Byte)
+	bandwidthBytesPerSec := bandwidth * 1_000_000
+
+	// 3. Il calcolo del tempo rimane lo stesso rapporto
+	transferTimeSeconds := dataSizeBytesFloat / bandwidthBytesPerSec
 	transferTimeMs := int64(transferTimeSeconds * 1000)
 
 	// Total time = network latency + actual transfer
