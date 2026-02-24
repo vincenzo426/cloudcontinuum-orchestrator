@@ -69,6 +69,7 @@ from .simulator import (
 )
 from .environment import CloudContinuumEnv
 from .inference import RLPlacementAgent, run_server
+from .training_logger import TrainingDataLogger, EpisodeDataLogger
 
 __all__ = [
     # Config
@@ -77,9 +78,7 @@ __all__ = [
     "PipelineSizeCategory",
     "DEFAULT_CLUSTERS",
     "DEFAULT_CONFIG",
-    "PIPELINE_TEMPLATES",
     "get_config_for_difficulty",
-    "MB", "GB",
     # Simulator
     "NetworkLatencyModel",
     "ExecutionTimeSimulator",
@@ -88,7 +87,7 @@ __all__ = [
     "estimate_optimal_cluster",
     # Environment
     "CloudContinuumEnv",
-    # Inference
-    "RLPlacementAgent",
-    "run_server",
+    # Logger
+    "TrainingDataLogger",
+    "EpisodeDataLogger",
 ]

@@ -9,8 +9,13 @@ from dataclasses import dataclass
 class NetworkLatencyModel:
     """Network latency model between clusters."""
     
-    def __init__(self, clusters_config: list = None):
+    # Edge-to-edge latency range (direct connection, 5-8ms)
+    EDGE_TO_EDGE_LATENCY_MIN = 5.0   # ms
+    EDGE_TO_EDGE_LATENCY_MAX = 8.0   # ms
+    
+    def __init__(self, clusters_config: list = None, seed: int = None):
         self.latency_matrix: Dict[str, Dict[str, float]] = {}
+        self._rng = np.random.default_rng(seed)
         if clusters_config:
             self._build_latency_matrix(clusters_config)
     
@@ -26,15 +31,49 @@ class NetworkLatencyModel:
                 elif dst.cluster_type == "cloud":
                     self.latency_matrix[src.name][dst.name] = src.latency_to_cloud
                 else:
-                    # Edge to edge: goes through cloud
-                    self.latency_matrix[src.name][dst.name] = \
-                        src.latency_to_cloud + dst.latency_to_cloud
+                    # Edge to edge: direct low-latency connection (5-8ms)
+                    self.latency_matrix[src.name][dst.name] = self._rng.uniform(
+                        self.EDGE_TO_EDGE_LATENCY_MIN,
+                        self.EDGE_TO_EDGE_LATENCY_MAX
+                    )
     
     def get_latency(self, source: str, destination: str) -> float:
         """Get latency in ms between two clusters."""
         if source in self.latency_matrix and destination in self.latency_matrix[source]:
             return self.latency_matrix[source][destination]
         return 0.0
+    
+    def get_latency_vector(self, source: str, cluster_names: list) -> np.ndarray:
+        """
+        Get latency vector from source to all clusters.
+        
+        Args:
+            source: Source cluster name (typically data_location)
+            cluster_names: Ordered list of cluster names
+        
+        Returns:
+            Array of latencies in ms, one per cluster
+        """
+        latencies = []
+        for dst in cluster_names:
+            latencies.append(self.get_latency(source, dst))
+        return np.array(latencies, dtype=np.float32)
+    
+    def get_normalized_latency_vector(self, source: str, cluster_names: list, 
+                                       max_latency: float = 50.0) -> np.ndarray:
+        """
+        Get normalized latency vector (0-1 range).
+        
+        Args:
+            source: Source cluster name
+            cluster_names: Ordered list of cluster names
+            max_latency: Maximum latency for normalization (default 50ms)
+        
+        Returns:
+            Normalized array of latencies (0-1)
+        """
+        latencies = self.get_latency_vector(source, cluster_names)
+        return np.clip(latencies / max_latency, 0.0, 1.0)
     
     def get_transfer_time(self, source: str, destination: str,
                           data_size_bytes: int = 100 * 1024 * 1024) -> float:
@@ -55,8 +94,8 @@ class ExecutionTimeSimulator:
     """
     
     # Network bandwidth estimates
-    BANDWIDTH_CLOUD_EDGE = 100 * 1024 * 1024  # 100 MB/s (fast link)
-    BANDWIDTH_EDGE_EDGE = 50 * 1024 * 1024    # 50 MB/s (goes through cloud)
+    BANDWIDTH_EDGE_EDGE = 100 * 1024 * 1024   # 100 MB/s
+    BANDWIDTH_CLOUD_EDGE = 50 * 1024 * 1024   # 50 MB/s
     
     def __init__(self, time_per_cpu_core: float = 30.0, latency_impact_factor: float = 0.5,
                  contention_impact_factor: float = 0.5, baseline_time: float = 60.0):
@@ -96,7 +135,7 @@ class ExecutionTimeSimulator:
         # Transfer time for remote data (based on actual data size)
         transfer_time = 0.0
         if not is_data_local and data_size_bytes > 0:
-            # Select bandwidth based on transfer type
+            # Edge-to-edge has better bandwidth due to direct connection
             bandwidth = self.BANDWIDTH_EDGE_EDGE if is_edge_to_edge else self.BANDWIDTH_CLOUD_EDGE
             
             # Transfer time = latency + data_size / bandwidth

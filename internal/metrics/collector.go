@@ -30,7 +30,7 @@ const (
 	// Quanto dura una reservation prima di scadere automaticamente.
 	// Deve essere abbastanza lungo da coprire il tempo necessario affinché
 	// i Pod diventino visibili nelle metriche K8s (tipicamente 10-30s).
-	defaultReservationTTL = 40 * time.Second
+	defaultReservationTTL = 60 * time.Second
 
 	// Ogni quanto pulire le reservation scadute
 	cleanupInterval = 15 * time.Second

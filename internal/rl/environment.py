@@ -22,6 +22,12 @@ class CloudContinuumEnv(gym.Env):
     """
     Gymnasium environment for intelligent ML pipeline placement.
     
+    Observation Space (33 features):
+      - Per-cluster (5 × 4 = 20): cpu_avail, mem_avail, is_data_local, can_fit, is_cloud
+      - Pipeline (5): cpu_ratio, mem_ratio, size_value, fits_edge, data_size_ratio
+      - Latency (4): normalized latency from data_location to each cluster
+      - Global (4): cloud_headroom, edge_avg_util, util_variance, remaining_ratio
+    
     The agent learns to:
     - Minimize execution time
     - Avoid myopic decisions (don't waste cloud on small pipelines)
@@ -47,7 +53,7 @@ class CloudContinuumEnv(gym.Env):
             contention_impact_factor=self.config.contention_impact_factor,
             baseline_time=self.config.baseline_execution_time
         )
-        self.network_model = NetworkLatencyModel(self.config.clusters)
+        self.network_model = NetworkLatencyModel(self.config.clusters, seed=seed)
         
         # Spaces
         self.action_space = spaces.Discrete(self.config.num_clusters)
@@ -208,7 +214,7 @@ class CloudContinuumEnv(gym.Env):
         is_data_local = self._is_data_local(pipeline['data_location'], cluster_name)
         latency = 0.0 if is_data_local else self.network_model.get_latency(pipeline['data_location'], cluster_name)
         
-        # Check if transfer is edge-to-edge (slower bandwidth)
+        # Check if transfer is edge-to-edge (faster bandwidth with direct connection)
         is_edge_to_edge = False
         if not is_data_local:
             src_type = self._get_cluster_type(pipeline['data_location'])
@@ -246,7 +252,8 @@ class CloudContinuumEnv(gym.Env):
         
         info = self._get_info()
         info.update({'placement_result': 'success', 'exec_time': exec_time,
-                     'target_cluster': cluster_name, 'time_elapsed': time_elapsed})
+                     'target_cluster': cluster_name, 'time_elapsed': time_elapsed,
+                     'latency_ms': latency, 'is_edge_to_edge': is_edge_to_edge})
         
         return self._get_observation(), reward, terminated, truncated, info
     
@@ -380,10 +387,18 @@ class CloudContinuumEnv(gym.Env):
     # === OBSERVATION ===
     
     def _get_observation(self) -> np.ndarray:
-        """Build observation vector (29 features)."""
+        """
+        Build observation vector (33 features).
+        
+        Structure:
+          [0-19]  Per-cluster features (5 × 4)
+          [20-24] Pipeline features (5)
+          [25-28] Latency vector (4) - normalized latency from data_location to each cluster
+          [29-32] Global features (4)
+        """
         obs = []
         
-        # Per-cluster features (5 × 4 = 20)
+        # === Per-cluster features (5 × 4 = 20) ===
         for cfg in self.config.clusters:
             cluster = self.clusters_state[cfg.name]
             obs.append(cluster.cpu_available / cluster.cpu_capacity)
@@ -397,7 +412,7 @@ class CloudContinuumEnv(gym.Env):
                 obs.extend([0.0, 0.0])
             obs.append(float(cluster.cluster_type == "cloud"))
         
-        # Pipeline features (5) - now includes data_size
+        # === Pipeline features (5) ===
         if self._current_pipeline:
             p = self._current_pipeline
             obs.append(min(p['cpu_required'] / self.config.max_cpu_available, 2.0))
@@ -407,13 +422,29 @@ class CloudContinuumEnv(gym.Env):
                 self.clusters_state[c.name].can_fit(p['cpu_required'], p['memory_required'])
                 for c in self.config.clusters if c.cluster_type == "edge"
             )))
-            # NEW: data_size ratio (normalized to max_data_size)
             data_size_ratio = p.get('data_size', 0) / self.config.max_data_size
             obs.append(min(data_size_ratio, 2.0))
         else:
             obs.extend([0.0, 0.0, 0.0, 0.0, 0.0])
         
-        # Global features (4)
+        # === Latency vector (4) - normalized latency from data_location to each cluster ===
+        if self._current_pipeline:
+            data_loc = self._current_pipeline['data_location']
+            if data_loc in ("none", "distributed"):
+                # Distributed data: zero latency (will be averaged at transfer)
+                latencies = [0.0] * self.config.num_clusters
+            else:
+                # Get normalized latencies from data_location to each cluster
+                latencies = self.network_model.get_normalized_latency_vector(
+                    data_loc, 
+                    self.config.cluster_names,
+                    max_latency=self.config.max_latency
+                ).tolist()
+            obs.extend(latencies)
+        else:
+            obs.extend([0.0] * self.config.num_clusters)
+        
+        # === Global features (4) ===
         cloud = self.clusters_state.get("cloud_cluster")
         obs.append(cloud.cpu_available / cloud.cpu_capacity if cloud else 0.0)
         

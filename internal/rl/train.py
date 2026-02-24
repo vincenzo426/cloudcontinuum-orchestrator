@@ -18,6 +18,7 @@ from stable_baselines3.common.logger import configure
 
 from .environment import CloudContinuumEnv
 from .config import get_config_for_difficulty
+from .training_logger import TrainingDataLogger, EpisodeDataLogger
 
 
 # === TRAINING CONFIG ===
@@ -130,7 +131,8 @@ def create_training_env(difficulty: str, seed: int, log_dir: str = None) -> Dumm
 # === TRAINING ===
 
 def train_stage(stage_name: str, config: Dict, model: Optional[MaskablePPO] = None,
-                save_dir: str = "./models", seed: int = 42) -> MaskablePPO:
+                save_dir: str = "./models", seed: int = 42,
+                log_training_data: bool = False) -> MaskablePPO:
     """Train a single curriculum stage."""
     print(f"\n{'='*60}\n  STAGE: {stage_name.upper()}\n{'='*60}")
     print(f"  Difficulty: {config['difficulty']} | Timesteps: {config['timesteps']:,}")
@@ -174,7 +176,7 @@ def train_stage(stage_name: str, config: Dict, model: Optional[MaskablePPO] = No
     eval_env.obs_rms = train_env.obs_rms
     
     # Callbacks
-    callbacks = CallbackList([
+    callbacks = [
         MaskableEvalCallback(eval_env, best_model_save_path=os.path.join(stage_dir, "best_model"),
                              log_path=os.path.join(stage_dir, "eval_logs"),
                              eval_freq=10000, n_eval_episodes=20, deterministic=True, verbose=1),
@@ -182,10 +184,37 @@ def train_stage(stage_name: str, config: Dict, model: Optional[MaskablePPO] = No
                           name_prefix=f"{stage_name}_ckpt", verbose=0),
         MetricsCallback(verbose=0),
         ProgressCallback(config['timesteps'], stage_name),
-    ])
+    ]
+    
+    # Add training data loggers if enabled
+    if log_training_data:
+        data_dir = os.path.join(stage_dir, "training_data")
+        os.makedirs(data_dir, exist_ok=True)
+        
+        # Full transition logger (saves all observations, actions, rewards)
+        training_logger = TrainingDataLogger(
+            output_dir=data_dir,
+            filename_prefix=f"transitions_{config['difficulty']}",
+            save_frequency=10000,
+            include_action_probs=True,
+            verbose=1,
+        )
+        callbacks.append(training_logger)
+        
+        # Episode summary logger
+        episode_logger = EpisodeDataLogger(
+            output_dir=data_dir,
+            filename_prefix=f"episodes_{config['difficulty']}",
+            verbose=1,
+        )
+        callbacks.append(episode_logger)
+        
+        print(f"  [DataLogger] Saving training data to: {data_dir}")
+    
+    callback_list = CallbackList(callbacks)
     
     # Train
-    model.learn(total_timesteps=config['timesteps'], callback=callbacks,
+    model.learn(total_timesteps=config['timesteps'], callback=callback_list,
                 progress_bar=True, reset_num_timesteps=(model is None))
     
     # Save
@@ -197,9 +226,12 @@ def train_stage(stage_name: str, config: Dict, model: Optional[MaskablePPO] = No
 
 
 def train_curriculum(save_dir: str = "./models", start_stage: str = "stage1_easy",
-                     resume_path: Optional[str] = None, seed: int = 42) -> MaskablePPO:
+                     resume_path: Optional[str] = None, seed: int = 42,
+                     log_training_data: bool = False) -> MaskablePPO:
     """Run full curriculum training."""
     print(f"\n{'='*60}\n  CURRICULUM LEARNING\n{'='*60}")
+    if log_training_data:
+        print("  [DataLogger] Training data logging ENABLED")
     
     stages = [
         ("stage1_easy", TRAINING_CONFIG["stage1_easy"]),
@@ -215,7 +247,7 @@ def train_curriculum(save_dir: str = "./models", start_stage: str = "stage1_easy
         model = MaskablePPO.load(resume_path, env=create_training_env("easy", seed))
     
     for stage_name, stage_config in stages_to_run:
-        model = train_stage(stage_name, stage_config, model, save_dir, seed)
+        model = train_stage(stage_name, stage_config, model, save_dir, seed, log_training_data)
     
     print("\n  TRAINING COMPLETED!")
     return model
@@ -293,6 +325,8 @@ def main():
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--eval-difficulty", default="hard", choices=["easy", "medium", "hard"])
+    parser.add_argument("--log-training-data", action="store_true",
+                        help="Save training data to CSV for analysis")
     args = parser.parse_args()
     
     if args.eval_only:
@@ -300,7 +334,8 @@ def main():
             raise ValueError("--model-path required for --eval-only")
         evaluate_model(args.model_path, args.eval_difficulty, args.eval_episodes)
     else:
-        train_curriculum(args.save_dir, args.start_stage, args.resume_path, args.seed)
+        train_curriculum(args.save_dir, args.start_stage, args.resume_path, args.seed,
+                        args.log_training_data)
         final_path = os.path.join(args.save_dir, "stage3_hard", "final_model.zip")
         if os.path.exists(final_path):
             evaluate_model(final_path, "hard", 100)

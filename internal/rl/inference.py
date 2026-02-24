@@ -13,24 +13,25 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from .config import ClusterConfig, DEFAULT_CLUSTERS, PipelineSizeCategory
+from .simulator import NetworkLatencyModel
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 class DummyEnv(gym.Env):
-    """Minimal environment for model loading."""
+    """Minimal environment for model loading (33 features)."""
     
     def __init__(self):
         super().__init__()
-        self.observation_space = spaces.Box(low=-1.0, high=2.0, shape=(29,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-1.0, high=2.0, shape=(33,), dtype=np.float32)
         self.action_space = spaces.Discrete(4)
     
     def reset(self, seed=None, options=None):
-        return np.zeros(29, dtype=np.float32), {}
+        return np.zeros(33, dtype=np.float32), {}
     
     def step(self, action):
-        return np.zeros(29, dtype=np.float32), 0.0, True, False, {}
+        return np.zeros(33, dtype=np.float32), 0.0, True, False, {}
     
     def action_masks(self):
         return np.ones(4, dtype=bool)
@@ -39,12 +40,18 @@ class DummyEnv(gym.Env):
 class RLPlacementAgent:
     """RL agent for production pipeline placement."""
     
+    MAX_LATENCY = 50.0  # ms, for normalization
+    MAX_DATA_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
+    
     def __init__(self, model_path: str, vec_normalize_path: str = None):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found: {model_path}")
         
         self.clusters = DEFAULT_CLUSTERS
         self.cluster_names = [c.name for c in self.clusters]
+        
+        # Initialize network model for latency calculations
+        self.network_model = NetworkLatencyModel(self.clusters)
         
         self.env = DummyVecEnv([lambda: DummyEnv()])
         self._has_normalize = False
@@ -56,7 +63,7 @@ class RLPlacementAgent:
             self._has_normalize = True
         
         self.model = MaskablePPO.load(model_path, env=self.env)
-        logger.info(f"RLPlacementAgent loaded: {model_path}")
+        logger.info(f"RLPlacementAgent loaded: {model_path} (33 features)")
     
     def predict(self, pipeline: Dict, clusters_state: Dict) -> Dict[str, Any]:
         """Predict target cluster for pipeline."""
@@ -85,12 +92,17 @@ class RLPlacementAgent:
                 pipeline.get('memory_required', 0)
             )
             
+            # Get latency info for reason
+            data_loc = pipeline.get('data_location', 'distributed')
+            latency = self.network_model.get_latency(data_loc, target) if data_loc not in ('none', 'distributed') else 0.0
+            
             return {
                 'target_cluster': target,
                 'confidence': float(probs[action]),
                 'action_probabilities': {name: float(probs[i]) for i, name in enumerate(self.cluster_names)},
-                'reason': f"RL: {size_cat} pipeline -> {target}, confidence {probs[action]:.2f}",
-                'is_valid': True
+                'reason': f"RL: {size_cat} pipeline -> {target}, confidence {probs[action]:.2f}, latency {latency:.1f}ms",
+                'is_valid': True,
+                'latency_ms': latency
             }
         except Exception as e:
             logger.error(f"Prediction failed: {e}")
@@ -101,14 +113,14 @@ class RLPlacementAgent:
             }
     
     def _build_observation(self, pipeline: Dict, clusters_state: Dict) -> np.ndarray:
-        """Build observation vector (29 features)."""
+        """Build observation vector (33 features)."""
         obs = []
         cpu_req = pipeline.get('cpu_required', 0)
         mem_req = pipeline.get('memory_required', 0)
         data_loc = pipeline.get('data_location', 'distributed')
-        data_size = pipeline.get('data_size', 0)  # NEW: data size in bytes
+        data_size = pipeline.get('data_size', 0)
         
-        # Per-cluster features (5 x 4 = 20)
+        # === Per-cluster features (5 x 4 = 20) ===
         for c in self.clusters:
             state = clusters_state.get(c.name, {})
             cpu_cap = state.get('cpu_capacity', c.cpu_capacity)
@@ -122,7 +134,7 @@ class RLPlacementAgent:
             obs.append(1.0 if cpu_avail >= cpu_req and mem_avail >= mem_req else 0.0)
             obs.append(1.0 if c.cluster_type == "cloud" else 0.0)
         
-        # Pipeline features (5) - includes data_size
+        # === Pipeline features (5) ===
         max_cpu = max(clusters_state.get(c.name, {}).get('cpu_available', c.cpu_available) for c in self.clusters)
         max_mem = max(clusters_state.get(c.name, {}).get('memory_available', c.memory_available) for c in self.clusters)
         _, size_val = PipelineSizeCategory.classify(cpu_req, mem_req)
@@ -137,12 +149,20 @@ class RLPlacementAgent:
         obs.append(min(mem_req / max_mem, 2.0) if max_mem > 0 else 0.0)
         obs.append(size_val)
         obs.append(1.0 if fits_edge else 0.0)
+        obs.append(min(data_size / self.MAX_DATA_SIZE, 2.0))
         
-        # NEW: data_size ratio (normalized to 5GB max)
-        max_data_size = 5 * 1024 * 1024 * 1024  # 5 GB
-        obs.append(min(data_size / max_data_size, 2.0))
+        # === Latency vector (4) - normalized latency from data_location to each cluster ===
+        if data_loc in ("none", "distributed"):
+            latencies = [0.0] * len(self.clusters)
+        else:
+            latencies = self.network_model.get_normalized_latency_vector(
+                data_loc, 
+                self.cluster_names,
+                max_latency=self.MAX_LATENCY
+            ).tolist()
+        obs.extend(latencies)
         
-        # Global features (4)
+        # === Global features (4) ===
         cloud = clusters_state.get('cloud_cluster', {})
         cloud_headroom = cloud.get('cpu_available', 0) / cloud.get('cpu_capacity', 8000)
         
@@ -159,15 +179,10 @@ class RLPlacementAgent:
                 if c.cluster_type == "edge":
                     edge_utils.append(avg_util)
         
-        # [25] Cloud headroom
         obs.append(cloud_headroom)
-        # [26] Average edge utilization
         obs.append(np.mean(edge_utils) if edge_utils else 0.0)
-        # [27] Utilization variance (load imbalance across all clusters)
-        util_variance = np.var(all_utils) if all_utils else 0.0
-        obs.append(min(util_variance * 10, 1.0))
-        # [28] Single pipeline indicator
-        obs.append(1.0)
+        obs.append(min(np.var(all_utils) * 10, 1.0) if all_utils else 0.0)
+        obs.append(1.0)  # Single pipeline indicator
         
         return np.array(obs, dtype=np.float32).reshape(1, -1)
     
@@ -205,7 +220,7 @@ agent: RLPlacementAgent = None
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy', 'model_loaded': agent is not None})
+    return jsonify({'status': 'healthy', 'model_loaded': agent is not None, 'features': 33})
 
 
 @app.route('/predict', methods=['POST'])

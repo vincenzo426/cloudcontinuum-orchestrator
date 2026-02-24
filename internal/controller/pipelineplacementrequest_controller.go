@@ -600,6 +600,7 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 		"cloud-only-pipeline":       pipeline.NewCloudOnlyPipelineStrategy(),
 		"data-locality-pipeline":    pipeline.NewDataLocalityPipelineStrategy(),
 		"simple-heuristic-pipeline": pipeline.NewSimplePipelineHeuristicStrategy(),
+		"random-pipeline":           pipeline.NewRandomPipelineStrategy(),
 		"rl-based-pipeline":         pipeline.NewRLPipelineStrategy("http://rl-service.kubeflow.svc.cluster.local:5000"),
 	}
 

@@ -127,6 +127,7 @@ spec:
                 - data-locality-pipeline
                 - simple-heuristic-pipeline
                 - rl-based-pipeline
+                - random-pipeline
                 type: string
             required:
             - pipelineName

@@ -17,7 +17,7 @@ class ClusterConfig:
     cluster_type: str           # "cloud" or "edge"
     baseline_cpu_requested: int = 0
     baseline_memory_requested: int = 0
-    latency_to_cloud: float = 0.0  # ms
+    latency_to_cloud: float = 0.0  # ms (edge-to-cloud ~20ms)
     
     def __post_init__(self):
         if self.cluster_type not in ("cloud", "edge"):
@@ -41,6 +41,7 @@ class ClusterConfig:
 
 
 # === DEFAULT CLUSTERS ===
+# Latency edge-to-cloud: ~20ms
 
 DEFAULT_CLUSTERS: List[ClusterConfig] = [
     ClusterConfig(
@@ -59,7 +60,7 @@ DEFAULT_CLUSTERS: List[ClusterConfig] = [
         cluster_type="edge",
         baseline_cpu_requested=3605,
         baseline_memory_requested=8912896000,
-        latency_to_cloud=15.0,
+        latency_to_cloud=18.0,  # ~20ms to cloud
     ),
     ClusterConfig(
         name="edge_cluster_2",
@@ -68,7 +69,7 @@ DEFAULT_CLUSTERS: List[ClusterConfig] = [
         cluster_type="edge",
         baseline_cpu_requested=3605,
         baseline_memory_requested=8912896000,
-        latency_to_cloud=20.0,
+        latency_to_cloud=20.0,  # ~20ms to cloud
     ),
     ClusterConfig(
         name="edge_cluster_3",
@@ -77,7 +78,7 @@ DEFAULT_CLUSTERS: List[ClusterConfig] = [
         cluster_type="edge",
         baseline_cpu_requested=3605,
         baseline_memory_requested=8912896000,
-        latency_to_cloud=25.0,
+        latency_to_cloud=22.0,  # ~20ms to cloud
     ),
 ]
 
@@ -145,7 +146,12 @@ class EnvironmentConfig:
     """
     Gymnasium environment configuration.
     
-    State space: 28 features (5 per cluster × 4 + 4 pipeline + 4 global)
+    State space: 33 features
+      - Per-cluster: 5 features × 4 clusters = 20
+      - Pipeline: 5 features
+      - Latency: 4 features (one per cluster, from data_location)
+      - Global: 4 features
+    
     Action space: Discrete(4) - cluster selection
     """
     
@@ -161,13 +167,15 @@ class EnvironmentConfig:
     data_locality_probability: float = 0.5
     pipeline_size_multiplier: float = 1.0
     
-    # State space (now 29 features: added data_size_ratio)
-    features_per_cluster: int = 5
-    features_pipeline: int = 5  # +1 for data_size_ratio
-    features_global: int = 4
+    # State space configuration
+    features_per_cluster: int = 5   # cpu_avail, mem_avail, is_data_local, can_fit, is_cloud
+    features_pipeline: int = 5      # cpu_ratio, mem_ratio, size_value, fits_edge, data_size_ratio
+    features_latency: int = 4       # latency from data_location to each cluster
+    features_global: int = 4        # cloud_headroom, edge_avg_util, util_variance, remaining_ratio
     
-    # Max data size for normalization (5 GB)
-    max_data_size: int = 5 * 1024 * 1024 * 1024
+    # Max values for normalization
+    max_data_size: int = 5 * 1024 * 1024 * 1024  # 5 GB
+    max_latency: float = 50.0  # ms - for normalizing latency features
     
     # Reward - failures
     reward_invalid_action: float = -1.0
@@ -224,8 +232,11 @@ class EnvironmentConfig:
     
     @property
     def total_state_size(self) -> int:
-        return (self.features_per_cluster * self.num_clusters) + \
-               self.features_pipeline + self.features_global
+        """Total observation vector size: 33 features."""
+        return (self.features_per_cluster * self.num_clusters + 
+                self.features_pipeline + 
+                self.features_latency +
+                self.features_global)
     
     @property
     def cluster_names(self) -> List[str]:

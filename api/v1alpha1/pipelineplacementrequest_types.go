@@ -27,7 +27,7 @@ type PipelinePlacementRequestSpec struct {
 	PipelineName string `json:"pipelineName"`
 
 	// PlacementStrategy specifies which strategy to use for placement
-	// +kubebuilder:validation:Enum=cloud-only-pipeline;data-locality-pipeline;simple-heuristic-pipeline;rl-based-pipeline
+	// +kubebuilder:validation:Enum=cloud-only-pipeline;data-locality-pipeline;simple-heuristic-pipeline;rl-based-pipeline;random-pipeline
 	// +kubebuilder:validation:Required
 	PlacementStrategy string `json:"placementStrategy"`
 
