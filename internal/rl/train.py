@@ -191,12 +191,14 @@ def train_stage(stage_name: str, config: Dict, model: Optional[MaskablePPO] = No
         data_dir = os.path.join(stage_dir, "training_data")
         os.makedirs(data_dir, exist_ok=True)
         
-        # Full transition logger (saves all observations, actions, rewards)
+        # Optimized transition logger with sampling (10% of steps, low RAM usage)
         training_logger = TrainingDataLogger(
             output_dir=data_dir,
             filename_prefix=f"transitions_{config['difficulty']}",
-            save_frequency=10000,
-            include_action_probs=True,
+            sampling_rate=0.10,      # Log only 10% of steps
+            buffer_size=500,         # Flush every 500 sampled rows
+            compress=False,          # Set True for .csv.gz (smaller files)
+            include_action_probs=False,  # Disable for faster logging
             verbose=1,
         )
         callbacks.append(training_logger)

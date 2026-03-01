@@ -1,8 +1,9 @@
 # internal/rl/training_logger.py
-"""Training Data Logger - Saves all transitions to CSV during training."""
+"""Training Data Logger - Optimized with streaming and sampling to minimize RAM usage."""
 
 import os
 import csv
+import gzip
 import numpy as np
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -13,19 +14,20 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 class TrainingDataLogger(BaseCallback):
     """
-    Callback that logs all training transitions to CSV.
+    Callback that logs training transitions to CSV with minimal RAM usage.
     
-    Saves for each step:
-      - Episode/step identifiers
-      - Full observation vector (33 features)
-      - Action taken
-      - Reward received
-      - Done flag
-      - Action mask
-      - Info dict fields (exec_time, target_cluster, etc.)
+    Optimizations:
+      - Streaming: writes directly to disk without accumulating all data in RAM
+      - Sampling: only logs a percentage of steps (default 10%)
+      - Small buffer: flushes frequently to keep memory footprint low
+      - Optional gzip compression: reduces disk space
     
     Usage:
-        logger = TrainingDataLogger(output_dir="./training_data")
+        logger = TrainingDataLogger(
+            output_dir="./training_data",
+            sampling_rate=0.10,  # Log 10% of steps
+            buffer_size=500,     # Flush every 500 sampled rows
+        )
         model.learn(total_timesteps=100000, callback=logger)
     """
     
@@ -50,18 +52,22 @@ class TrainingDataLogger(BaseCallback):
         self,
         output_dir: str = "./training_data",
         filename_prefix: str = "training_data",
-        save_frequency: int = 10000,
+        sampling_rate: float = 0.10,
+        buffer_size: int = 500,
+        compress: bool = False,
         include_action_probs: bool = False,
         verbose: int = 1
     ):
         """
-        Initialize training data logger.
+        Initialize optimized training data logger.
         
         Args:
             output_dir: Directory to save CSV files
             filename_prefix: Prefix for output filenames
-            save_frequency: Flush to disk every N steps
-            include_action_probs: Whether to include action probabilities (slower)
+            sampling_rate: Fraction of steps to log (0.0-1.0). Default 0.10 = 10%
+            buffer_size: Number of rows to buffer before flushing to disk
+            compress: If True, write gzip compressed CSV (.csv.gz)
+            include_action_probs: Whether to include action probabilities
             verbose: Verbosity level
         """
         super().__init__(verbose)
@@ -70,251 +76,219 @@ class TrainingDataLogger(BaseCallback):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.filename_prefix = filename_prefix
-        self.save_frequency = save_frequency
+        self.sampling_rate = np.clip(sampling_rate, 0.01, 1.0)
+        self.buffer_size = buffer_size
+        self.compress = compress
         self.include_action_probs = include_action_probs
         
-        # Buffer for batch writing
-        self.buffer: List[Dict[str, Any]] = []
+        # Streaming buffer (small, fixed size)
+        self._buffer: List[List[Any]] = []
+        self._header: List[str] = []
+        
+        # File handle for streaming writes
+        self._file = None
+        self._csv_writer = None
+        
+        # Stats
+        self.total_steps_seen = 0
         self.total_steps_logged = 0
         self.current_episode = 0
         
-        # File handles
-        self._csv_file = None
-        self._csv_writer = None
-        self._header_written = False
+        # Random generator for sampling
+        self._rng = np.random.default_rng()
         
-        # Current file path
+        # File path
         self.current_filepath: Optional[Path] = None
     
     def _init_callback(self) -> None:
         """Initialize callback when training starts."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.current_filepath = self.output_dir / f"{self.filename_prefix}_{timestamp}.csv"
+        ext = ".csv.gz" if self.compress else ".csv"
+        self.current_filepath = self.output_dir / f"{self.filename_prefix}_{timestamp}{ext}"
+        
+        # Build header
+        self._header = self._build_header()
+        
+        # Open file for streaming writes
+        if self.compress:
+            self._file = gzip.open(self.current_filepath, 'wt', newline='', encoding='utf-8')
+        else:
+            self._file = open(self.current_filepath, 'w', newline='', encoding='utf-8')
+        
+        self._csv_writer = csv.writer(self._file)
+        self._csv_writer.writerow(self._header)
+        self._file.flush()
         
         if self.verbose > 0:
-            print(f"[TrainingDataLogger] Saving to: {self.current_filepath}")
+            print(f"[TrainingDataLogger] Output: {self.current_filepath}")
+            print(f"[TrainingDataLogger] Sampling rate: {self.sampling_rate*100:.0f}%")
+            print(f"[TrainingDataLogger] Buffer size: {self.buffer_size}")
     
-    def _get_csv_header(self) -> List[str]:
+    def _build_header(self) -> List[str]:
         """Generate CSV header."""
-        header = [
-            "timestamp",
-            "episode",
-            "step",
-            "global_step",
-        ]
-        
-        # Observation features
+        header = ["episode", "global_step"]
         header.extend(self.OBSERVATION_FEATURES)
+        header.extend(["action", "reward", "done"])
+        header.extend([f"mask_{i}" for i in range(4)])
         
-        # Action and reward
-        header.extend([
-            "action",
-            "action_name",
-            "reward",
-            "done",
-            "truncated",
-        ])
-        
-        # Action mask
-        header.extend([f"mask_{name}" for name in self.CLUSTER_NAMES])
-        
-        # Action probabilities (optional)
         if self.include_action_probs:
-            header.extend([f"prob_{name}" for name in self.CLUSTER_NAMES])
+            header.extend([f"prob_{i}" for i in range(4)])
         
-        # Info fields
-        header.extend([
-            "placement_result",
-            "exec_time",
-            "target_cluster",
-            "latency_ms",
-            "is_edge_to_edge",
-            "success_rate",
-            "locality_rate",
-        ])
+        header.extend(["placement_result", "exec_time", "latency_ms", "success_rate"])
         
         return header
     
     def _on_step(self) -> bool:
-        """Called at each training step."""
-        # Get data from locals
-        obs = self.locals.get("obs_tensor")
-        if obs is None:
-            obs = self.locals.get("new_obs")
+        """Called at each training step - samples and logs data."""
+        self.total_steps_seen += 1
         
-        actions = self.locals.get("actions")
-        rewards = self.locals.get("rewards")
-        dones = self.locals.get("dones")
-        infos = self.locals.get("infos", [{}])
+        # Sampling: skip most steps to reduce data volume
+        if self._rng.random() > self.sampling_rate:
+            # Still track episode boundaries even when not logging
+            dones = self.locals.get("dones", [False])
+            if dones and dones[0]:
+                self.current_episode += 1
+            return True
         
-        # Handle vectorized environments
-        if obs is not None:
-            if hasattr(obs, 'cpu'):
-                obs = obs.cpu().numpy()
-            if len(obs.shape) > 1:
-                obs = obs[0]  # Take first env
+        # Extract data from training locals
+        row = self._extract_step_data()
+        if row is not None:
+            self._buffer.append(row)
+            self.total_steps_logged += 1
         
-        if actions is not None:
-            action = int(actions[0]) if hasattr(actions, '__len__') else int(actions)
-        else:
-            action = -1
-        
-        reward = float(rewards[0]) if rewards is not None and len(rewards) > 0 else 0.0
-        done = bool(dones[0]) if dones is not None and len(dones) > 0 else False
-        info = infos[0] if infos else {}
-        
-        # Get action mask from environment
-        action_mask = np.ones(4, dtype=bool)
-        if hasattr(self.training_env, 'env_method'):
-            try:
-                masks = self.training_env.env_method('action_masks')
-                if masks and len(masks) > 0:
-                    action_mask = np.array(masks[0], dtype=bool)
-            except Exception:
-                pass
-        
-        # Get action probabilities (optional)
-        action_probs = None
-        if self.include_action_probs and self.model is not None:
-            try:
-                obs_tensor = self.model.policy.obs_to_tensor(obs.reshape(1, -1))[0]
-                distribution = self.model.policy.get_distribution(obs_tensor)
-                action_probs = distribution.distribution.probs.detach().cpu().numpy()[0]
-            except Exception:
-                action_probs = np.zeros(4)
-        
-        # Track episodes
-        if done:
+        # Track episode boundaries
+        dones = self.locals.get("dones", [False])
+        if dones and dones[0]:
             self.current_episode += 1
         
-        # Build row
-        row = self._build_row(
-            obs=obs,
-            action=action,
-            reward=reward,
-            done=done,
-            truncated=info.get('TimeLimit.truncated', False),
-            action_mask=action_mask,
-            action_probs=action_probs,
-            info=info
-        )
-        
-        self.buffer.append(row)
-        self.total_steps_logged += 1
-        
-        # Flush periodically
-        if len(self.buffer) >= self.save_frequency:
+        # Flush buffer when full
+        if len(self._buffer) >= self.buffer_size:
             self._flush_buffer()
         
         return True
     
-    def _build_row(
-        self,
-        obs: np.ndarray,
-        action: int,
-        reward: float,
-        done: bool,
-        truncated: bool,
-        action_mask: np.ndarray,
-        action_probs: Optional[np.ndarray],
-        info: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Build a single CSV row."""
-        row = {
-            "timestamp": datetime.now().isoformat(),
-            "episode": self.current_episode,
-            "step": info.get('step', self.num_timesteps),
-            "global_step": self.num_timesteps,
-        }
-        
-        # Observation features
-        if obs is not None and len(obs) >= len(self.OBSERVATION_FEATURES):
-            for i, name in enumerate(self.OBSERVATION_FEATURES):
-                row[name] = float(obs[i])
-        else:
-            for name in self.OBSERVATION_FEATURES:
-                row[name] = 0.0
-        
-        # Action and reward
-        row["action"] = action
-        row["action_name"] = self.CLUSTER_NAMES[action] if 0 <= action < len(self.CLUSTER_NAMES) else "unknown"
-        row["reward"] = reward
-        row["done"] = done
-        row["truncated"] = truncated
-        
-        # Action mask
-        for i, name in enumerate(self.CLUSTER_NAMES):
-            row[f"mask_{name}"] = bool(action_mask[i]) if i < len(action_mask) else True
-        
-        # Action probabilities
-        if self.include_action_probs:
-            for i, name in enumerate(self.CLUSTER_NAMES):
-                row[f"prob_{name}"] = float(action_probs[i]) if action_probs is not None and i < len(action_probs) else 0.25
-        
-        # Info fields
-        row["placement_result"] = info.get('placement_result', '')
-        row["exec_time"] = info.get('exec_time', 0.0)
-        row["target_cluster"] = info.get('target_cluster', '')
-        row["latency_ms"] = info.get('latency_ms', 0.0)
-        row["is_edge_to_edge"] = info.get('is_edge_to_edge', False)
-        row["success_rate"] = info.get('success_rate', 0.0)
-        row["locality_rate"] = info.get('locality_rate', 0.0)
-        
-        return row
+    def _extract_step_data(self) -> Optional[List[Any]]:
+        """Extract and format data for current step. Returns row as list."""
+        try:
+            # Get observation
+            obs = self.locals.get("obs_tensor")
+            if obs is None:
+                obs = self.locals.get("new_obs")
+            
+            if obs is not None:
+                if hasattr(obs, 'cpu'):
+                    obs = obs.cpu().numpy()
+                if len(obs.shape) > 1:
+                    obs = obs[0]
+            else:
+                return None
+            
+            # Get action, reward, done
+            actions = self.locals.get("actions")
+            rewards = self.locals.get("rewards", [0.0])
+            dones = self.locals.get("dones", [False])
+            infos = self.locals.get("infos", [{}])
+            
+            action = int(actions[0]) if actions is not None and hasattr(actions, '__len__') else -1
+            reward = float(rewards[0]) if rewards is not None and len(rewards) > 0 else 0.0
+            done = bool(dones[0]) if dones is not None and len(dones) > 0 else False
+            info = infos[0] if infos else {}
+            
+            # Build row (as list for efficiency)
+            row = [self.current_episode, self.num_timesteps]
+            
+            # Observation features (33 values)
+            if len(obs) >= len(self.OBSERVATION_FEATURES):
+                row.extend([round(float(obs[i]), 4) for i in range(len(self.OBSERVATION_FEATURES))])
+            else:
+                row.extend([0.0] * len(self.OBSERVATION_FEATURES))
+            
+            # Action, reward, done
+            row.extend([action, round(reward, 4), int(done)])
+            
+            # Action mask
+            action_mask = [1, 1, 1, 1]  # Default all valid
+            if hasattr(self.training_env, 'env_method'):
+                try:
+                    masks = self.training_env.env_method('action_masks')
+                    if masks and len(masks) > 0:
+                        action_mask = [int(m) for m in masks[0][:4]]
+                except Exception:
+                    pass
+            row.extend(action_mask)
+            
+            # Action probabilities (optional)
+            if self.include_action_probs:
+                probs = [0.25, 0.25, 0.25, 0.25]
+                if self.model is not None:
+                    try:
+                        obs_tensor = self.model.policy.obs_to_tensor(obs.reshape(1, -1))[0]
+                        dist = self.model.policy.get_distribution(obs_tensor)
+                        probs = dist.distribution.probs.detach().cpu().numpy()[0].tolist()
+                    except Exception:
+                        pass
+                row.extend([round(p, 4) for p in probs[:4]])
+            
+            # Info fields
+            row.append(info.get('placement_result', ''))
+            row.append(round(info.get('exec_time', 0.0), 2))
+            row.append(round(info.get('latency_ms', 0.0), 2))
+            row.append(round(info.get('success_rate', 0.0), 4))
+            
+            return row
+            
+        except Exception as e:
+            if self.verbose > 0:
+                print(f"[TrainingDataLogger] Error extracting step data: {e}")
+            return None
     
     def _flush_buffer(self) -> None:
-        """Write buffer to CSV file."""
-        if not self.buffer:
+        """Write buffer to disk and clear it."""
+        if not self._buffer or self._csv_writer is None:
             return
         
-        # Open file if needed
-        if self._csv_file is None:
-            self._csv_file = open(self.current_filepath, 'w', newline='', encoding='utf-8')
-            self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=self._get_csv_header())
-            self._csv_writer.writeheader()
-            self._header_written = True
+        self._csv_writer.writerows(self._buffer)
+        self._file.flush()
         
-        # Write rows
-        for row in self.buffer:
-            self._csv_writer.writerow(row)
+        if self.verbose > 1:
+            print(f"[TrainingDataLogger] Flushed {len(self._buffer)} rows")
         
-        self._csv_file.flush()
-        
-        if self.verbose > 0:
-            print(f"[TrainingDataLogger] Flushed {len(self.buffer)} rows (total: {self.total_steps_logged})")
-        
-        self.buffer.clear()
-    
-    def _on_training_end(self) -> None:
-        """Called when training ends."""
-        self._flush_buffer()
-        
-        if self._csv_file is not None:
-            self._csv_file.close()
-            self._csv_file = None
-        
-        if self.verbose > 0:
-            print(f"[TrainingDataLogger] Training complete. Total rows: {self.total_steps_logged}")
-            print(f"[TrainingDataLogger] Output: {self.current_filepath}")
+        self._buffer.clear()
     
     def _on_rollout_end(self) -> None:
-        """Called at the end of a rollout."""
-        # Optionally flush at rollout end
-        if len(self.buffer) > self.save_frequency // 2:
+        """Flush at end of each rollout to prevent data loss."""
+        if len(self._buffer) > 0:
             self._flush_buffer()
+    
+    def _on_training_end(self) -> None:
+        """Final flush and cleanup."""
+        self._flush_buffer()
+        
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+            self._csv_writer = None
+        
+        if self.verbose > 0:
+            print(f"[TrainingDataLogger] Training complete.")
+            print(f"[TrainingDataLogger] Steps seen: {self.total_steps_seen:,}")
+            print(f"[TrainingDataLogger] Steps logged: {self.total_steps_logged:,} ({self.total_steps_logged/max(1,self.total_steps_seen)*100:.1f}%)")
+            print(f"[TrainingDataLogger] Output: {self.current_filepath}")
 
 
 class EpisodeDataLogger(BaseCallback):
     """
-    Simpler callback that logs episode-level summaries to CSV.
+    Lightweight callback that logs only episode-level summaries.
     
-    More lightweight than TrainingDataLogger, useful for quick analysis.
+    Much more memory efficient than step-level logging.
+    Writes directly to disk at end of each episode.
     """
     
     def __init__(
         self,
         output_dir: str = "./training_data",
         filename_prefix: str = "episodes",
+        buffer_size: int = 100,
         verbose: int = 1
     ):
         super().__init__(verbose)
@@ -322,45 +296,85 @@ class EpisodeDataLogger(BaseCallback):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        self.buffer_size = buffer_size
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.filepath = self.output_dir / f"{filename_prefix}_{timestamp}.csv"
         
-        self.episodes: List[Dict] = []
+        # Streaming
+        self._file = None
+        self._csv_writer = None
+        self._buffer: List[List[Any]] = []
+        self._header_written = False
+        
+        # Episode tracking
         self.current_episode_rewards: List[float] = []
-        self.current_episode_start = 0
+        self.total_episodes = 0
+    
+    def _init_callback(self) -> None:
+        """Open file for streaming writes."""
+        self._file = open(self.filepath, 'w', newline='', encoding='utf-8')
+        self._csv_writer = csv.writer(self._file)
+        
+        # Write header
+        header = [
+            "episode", "timestep", "length", "total_reward", "mean_reward",
+            "success_rate", "locality_rate", "avg_exec_time",
+            "placements_successful", "placements_failed"
+        ]
+        self._csv_writer.writerow(header)
+        self._file.flush()
+        
+        if self.verbose > 0:
+            print(f"[EpisodeDataLogger] Output: {self.filepath}")
     
     def _on_step(self) -> bool:
         rewards = self.locals.get("rewards", [0.0])
         dones = self.locals.get("dones", [False])
         infos = self.locals.get("infos", [{}])
         
-        self.current_episode_rewards.append(float(rewards[0]))
+        if rewards:
+            self.current_episode_rewards.append(float(rewards[0]))
         
-        if dones[0]:
-            info = infos[0]
-            episode_data = {
-                "episode": len(self.episodes),
-                "timestep": self.num_timesteps,
-                "length": len(self.current_episode_rewards),
-                "total_reward": sum(self.current_episode_rewards),
-                "mean_reward": np.mean(self.current_episode_rewards),
-                "success_rate": info.get('success_rate', 0.0),
-                "locality_rate": info.get('locality_rate', 0.0),
-                "avg_exec_time": info.get('avg_exec_time', 0.0),
-                "placements_successful": info.get('placements_successful', 0),
-                "placements_failed": info.get('placements_failed', 0),
-            }
-            self.episodes.append(episode_data)
+        if dones and dones[0]:
+            info = infos[0] if infos else {}
+            
+            row = [
+                self.total_episodes,
+                self.num_timesteps,
+                len(self.current_episode_rewards),
+                round(sum(self.current_episode_rewards), 4),
+                round(np.mean(self.current_episode_rewards) if self.current_episode_rewards else 0.0, 4),
+                round(info.get('success_rate', 0.0), 4),
+                round(info.get('locality_rate', 0.0), 4),
+                round(info.get('avg_exec_time', 0.0), 2),
+                info.get('placements_successful', 0),
+                info.get('placements_failed', 0),
+            ]
+            
+            self._buffer.append(row)
+            self.total_episodes += 1
             self.current_episode_rewards = []
+            
+            # Flush periodically
+            if len(self._buffer) >= self.buffer_size:
+                self._flush_buffer()
         
         return True
     
+    def _flush_buffer(self) -> None:
+        """Write buffer to disk."""
+        if self._buffer and self._csv_writer:
+            self._csv_writer.writerows(self._buffer)
+            self._file.flush()
+            self._buffer.clear()
+    
     def _on_training_end(self) -> None:
-        if self.episodes:
-            with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.episodes[0].keys())
-                writer.writeheader()
-                writer.writerows(self.episodes)
-            
-            if self.verbose > 0:
-                print(f"[EpisodeDataLogger] Saved {len(self.episodes)} episodes to {self.filepath}")
+        self._flush_buffer()
+        
+        if self._file:
+            self._file.close()
+            self._file = None
+        
+        if self.verbose > 0:
+            print(f"[EpisodeDataLogger] Saved {self.total_episodes} episodes to {self.filepath}")

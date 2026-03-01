@@ -83,7 +83,7 @@ def simulate_with_custom_model(model_path: str, vec_norm_path: str = None):
 if __name__ == "__main__":
     # Inserisci qui i percorsi effettivi del tuo modello
     # Assicurati che puntino ai file corretti (.zip per il modello, .pkl per la normalizzazione)
-    MY_MODEL_PATH = "./model_with_data/stage3_hard/final_model.zip" 
-    MY_VEC_NORM_PATH = "./model_with_data/stage3_hard/vec_normalize.pkl"
+    MY_MODEL_PATH = "./models_with_latencies/stage3_hard/final_model.zip" 
+    MY_VEC_NORM_PATH = "./models_with_latencies/stage3_hard/vec_normalize.pkl"
 
     simulate_with_custom_model(MY_MODEL_PATH, MY_VEC_NORM_PATH)
