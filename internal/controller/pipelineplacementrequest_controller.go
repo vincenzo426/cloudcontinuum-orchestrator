@@ -63,6 +63,9 @@ type PipelinePlacementRequestReconciler struct {
 	kubeflowManager    *kubeflow.Manager
 	transferCalculator *datatransfer.Calculator
 
+	// NEW: Data transfer simulator for real network traffic simulation
+	transferSimulator *datatransfer.Simulator
+
 	// Reference to RealMetricsCollector for reservation support
 	realMetricsCollector *metrics.RealMetricsCollector
 }
@@ -73,6 +76,7 @@ type PipelinePlacementRequestReconciler struct {
 // +kubebuilder:rbac:groups=orchestrator.cloudcontinuum.io,resources=pipelineplacementrequests/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile handles the lifecycle of PipelinePlacementRequests.
 func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -114,6 +118,31 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 	// Add reservation after successful decision
 	r.addReservationForPipeline(ppr.Name, targetCluster, resources)
 
+	// =========================================================================
+	// NEW: SIMULATE DATA TRANSFER OVER SUBMARINER NETWORK
+	// =========================================================================
+	transferStatus, err := r.simulateDataTransfer(ctx, ppr, ppr.Spec.DataLocation, targetCluster)
+	if err != nil {
+		// Remove reservation on failure
+		r.removeReservationForPipeline(ppr.Name)
+		return r.failWithStatus(ctx, ppr, err, "Data transfer failed", requeueDelayLong)
+	}
+
+	// Update transfer info with actual measured values if transfer occurred
+	if transferStatus != nil && transferStatus.DurationMs > 0 {
+		logger.Info("[TRANSFER] Actual transfer completed",
+			"estimated", fmt.Sprintf("%dms", transferInfo.TransferTime),
+			"actual", fmt.Sprintf("%dms", transferStatus.DurationMs),
+			"bytes", transferStatus.BytesTransferred)
+
+		// Update transfer details with actual measurement
+		transferInfo.TransferDetails = fmt.Sprintf("%s | Actual transfer: %dms (%s)",
+			transferInfo.TransferDetails,
+			transferStatus.DurationMs,
+			formatBytes(transferStatus.BytesTransferred))
+	}
+	// =========================================================================
+
 	// Execute pipeline
 	runID, runURL, err := r.executePipeline(ctx, ppr, pipelineIR, targetCluster, pipelineYAML)
 	if err != nil {
@@ -126,6 +155,79 @@ func (r *PipelinePlacementRequestReconciler) Reconcile(ctx context.Context, req 
 
 	// Update final status
 	return r.updateStatusAndComplete(ctx, ppr, targetCluster, decision, resources, transferInfo, runID, runURL, true, "")
+}
+
+// =============================================================================
+// DATA TRANSFER SIMULATION
+// =============================================================================
+
+// simulateDataTransfer performs actual data transfer over Submariner network
+// This creates a Job that sends data from source cluster to target cluster's data-sink service
+func (r *PipelinePlacementRequestReconciler) simulateDataTransfer(
+	ctx context.Context,
+	ppr *orchestratorv1alpha1.PipelinePlacementRequest,
+	dataLocation string,
+	targetCluster string,
+) (*datatransfer.TransferStatus, error) {
+	logger := log.FromContext(ctx)
+
+	// Skip if simulator not initialized
+	if r.transferSimulator == nil {
+		logger.Info("[TRANSFER] Simulator not initialized, skipping actual transfer")
+		return &datatransfer.TransferStatus{
+			Completed:        true,
+			DurationMs:       0,
+			BytesTransferred: 0,
+		}, nil
+	}
+
+	// Skip if no transfer needed
+	if dataLocation == "" || dataLocation == "none" || dataLocation == targetCluster {
+		logger.Info("[TRANSFER] No data transfer needed",
+			"dataLocation", dataLocation,
+			"targetCluster", targetCluster)
+		return &datatransfer.TransferStatus{
+			Completed:        true,
+			DurationMs:       0,
+			BytesTransferred: 0,
+		}, nil
+	}
+
+	// Parse data size from spec (default to 1GB if not specified)
+	dataSize := ppr.Spec.DataSize
+	if dataSize == "" {
+		dataSize = "1GB"
+	}
+
+	dataSizeBytes, err := datatransfer.ParseDataSize(dataSize)
+	if err != nil {
+		return nil, fmt.Errorf("invalid data size: %w", err)
+	}
+
+	logger.Info("[TRANSFER] Starting simulated data transfer over Submariner",
+		"source", dataLocation,
+		"target", targetCluster,
+		"size", dataSize,
+		"bytes", dataSizeBytes)
+
+	// Execute the transfer
+	status, err := r.transferSimulator.SimulateTransfer(ctx, &datatransfer.TransferRequest{
+		SourceCluster: dataLocation,
+		TargetCluster: targetCluster,
+		DataSizeBytes: dataSizeBytes,
+		PipelineName:  ppr.Name,
+		Namespace:     ppr.Namespace,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("data transfer failed: %w", err)
+	}
+
+	if status.Failed {
+		return status, fmt.Errorf("data transfer failed: %s", status.ErrorMessage)
+	}
+
+	return status, nil
 }
 
 // =============================================================================
@@ -150,6 +252,13 @@ func (r *PipelinePlacementRequestReconciler) removeReservationForPipeline(pipeli
 		return
 	}
 	r.realMetricsCollector.RemoveReservation(pipelineName)
+}
+
+func (r *PipelinePlacementRequestReconciler) getActiveReservationsCount() int {
+	if r.realMetricsCollector != nil {
+		return r.realMetricsCollector.GetActiveReservationsCount()
+	}
+	return 0
 }
 
 // =============================================================================
@@ -280,20 +389,13 @@ func (r *PipelinePlacementRequestReconciler) collectMetricsWithReservation(ctx c
 	}
 
 	// Fallback: use standard Collector interface
-	metrics, err := r.MetricsCollector.CollectMetrics(ctx)
+	collectedMetrics, err := r.MetricsCollector.CollectMetrics(ctx)
 	if err != nil {
 		logger.Error(err, "[WARN] Using fallback metrics")
 	}
 
 	logger.V(1).Info("[METRICS] Real metrics collected (no reservation support)")
-	return metrics, metricsAge, nil
-}
-
-func (r *PipelinePlacementRequestReconciler) getActiveReservationsCount() int {
-	if r.realMetricsCollector != nil {
-		return r.realMetricsCollector.GetActiveReservationsCount()
-	}
-	return 0
+	return collectedMetrics, metricsAge, nil
 }
 
 // =============================================================================
@@ -342,14 +444,14 @@ func (r *PipelinePlacementRequestReconciler) fetchPipelineYAML(ctx context.Conte
 }
 
 func (r *PipelinePlacementRequestReconciler) fetchFromURL(ctx context.Context, url string) (string, error) {
-	client := &http.Client{Timeout: httpTimeout}
+	httpClient := &http.Client{Timeout: httpTimeout}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("HTTP request: %w", err)
 	}
@@ -589,6 +691,26 @@ func (r *PipelinePlacementRequestReconciler) getNetworkLatency(
 	}
 }
 
+// formatBytes formats bytes to human-readable string
+func formatBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
 // =============================================================================
 // SETUP
 // =============================================================================
@@ -600,7 +722,6 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 		"cloud-only-pipeline":       pipeline.NewCloudOnlyPipelineStrategy(),
 		"data-locality-pipeline":    pipeline.NewDataLocalityPipelineStrategy(),
 		"simple-heuristic-pipeline": pipeline.NewSimplePipelineHeuristicStrategy(),
-		"random-pipeline":           pipeline.NewRandomPipelineStrategy(),
 		"rl-based-pipeline":         pipeline.NewRLPipelineStrategy("http://rl-service.kubeflow.svc.cluster.local:5000"),
 	}
 
@@ -619,6 +740,10 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	}
 	r.ClusterManager = clusterManager
 
+	// NEW: Initialize data transfer simulator
+	r.transferSimulator = datatransfer.NewSimulator(clusterManager)
+	ctrl.Log.Info("[INIT] Data transfer simulator initialized")
+
 	// Create metrics collector with reservation support
 	metricsCollector := metrics.NewRealMetricsCollector(clusterManager.ClusterClients, metrics.DefaultConfig())
 	r.MetricsCollector = metricsCollector
@@ -635,7 +760,8 @@ func (r *PipelinePlacementRequestReconciler) SetupWithManager(mgr ctrl.Manager) 
 	ctrl.Log.Info("[INIT] PipelinePlacementRequest controller initialized",
 		"clusters", clusterManager.ListClusters(),
 		"strategies", len(r.pipelineStrategies),
-		"reservationSupport", true)
+		"reservationSupport", true,
+		"dataTransferSimulation", true)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&orchestratorv1alpha1.PipelinePlacementRequest{}).

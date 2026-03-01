@@ -1,27 +1,26 @@
-# Prometheus Monitor Service (Metrics)
+# Prometheus ServiceMonitor per il controller CloudContinuum
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
+  name: cloudcontinuum-controller-metrics
+  namespace: monitoring  # IMPORTANTE: stesso namespace di Prometheus
   labels:
-    control-plane: controller-manager
     app.kubernetes.io/name: cloudcontinuum-orchestrator
-    app.kubernetes.io/managed-by: kustomize
-  name: controller-manager-metrics-monitor
-  namespace: system
+    release: prometheus-stack  # Label per essere scoperto da Prometheus
 spec:
-  endpoints:
-    - path: /metrics
-      port: https # Ensure this is the name of the port that exposes HTTPS metrics
-      scheme: https
-      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-      tlsConfig:
-        # TODO(user): The option insecureSkipVerify: true is not recommended for production since it disables
-        # certificate verification, exposing the system to potential man-in-the-middle attacks.
-        # For production environments, it is recommended to use cert-manager for automatic TLS certificate management.
-        # To apply this configuration, enable cert-manager and use the patch located at config/prometheus/servicemonitor_tls_patch.yaml,
-        # which securely references the certificate from the 'metrics-server-cert' secret.
-        insecureSkipVerify: true
+  namespaceSelector:
+    matchNames:
+      - cloudcontinuum-orchestrator-system
   selector:
     matchLabels:
       control-plane: controller-manager
       app.kubernetes.io/name: cloudcontinuum-orchestrator
+  endpoints:
+    - port: https
+      path: /metrics
+      scheme: https
+      interval: 15s  # Scrape ogni 15 secondi
+      scrapeTimeout: 10s
+      tlsConfig:
+        insecureSkipVerify: true  # Per sviluppo, in prod usa cert-manager
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token

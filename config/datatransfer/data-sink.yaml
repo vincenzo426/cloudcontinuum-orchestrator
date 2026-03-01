@@ -1,0 +1,188 @@
+# Data Sink Service con Monitoring per CloudContinuum
+# Questa versione include contatori per monitorare il traffico in arrivo
+#
+# Deploy su TUTTI i cluster:
+#   kubectl apply -f data-sink-monitoring.yaml --context=<cluster>
+#
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloudcontinuum-system
+  labels:
+    app.kubernetes.io/name: cloudcontinuum
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-sink-scripts
+  namespace: cloudcontinuum-system
+data:
+  sink-server.sh: |
+    #!/bin/sh
+    # Data Sink Server con monitoring
+    
+    PORT=9999
+    METRICS_FILE="/tmp/metrics.txt"
+    LOG_FILE="/tmp/transfer.log"
+    
+    # Inizializza metriche
+    echo "0" > /tmp/total_bytes
+    echo "0" > /tmp/total_connections
+    
+    log() {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
+    }
+    
+    update_metrics() {
+      local bytes=$1
+      local current=$(cat /tmp/total_bytes)
+      echo $((current + bytes)) > /tmp/total_bytes
+      
+      local conns=$(cat /tmp/total_connections)
+      echo $((conns + 1)) > /tmp/total_connections
+    }
+    
+    log "Starting Data Sink Server on port $PORT"
+    log "Metrics available at /tmp/total_bytes and /tmp/total_connections"
+    
+    while true; do
+      log "Waiting for incoming connection..."
+      
+      # Ricevi dati, conta i byte, scrivi su /dev/null
+      BYTES_RECEIVED=$(nc -l -p $PORT 2>/dev/null | tee >(wc -c > /tmp/last_transfer_bytes) | cat > /dev/null; cat /tmp/last_transfer_bytes)
+      
+      if [ -n "$BYTES_RECEIVED" ] && [ "$BYTES_RECEIVED" -gt 0 ]; then
+        update_metrics $BYTES_RECEIVED
+        TOTAL=$(cat /tmp/total_bytes)
+        CONNS=$(cat /tmp/total_connections)
+        
+        # Converti in formato leggibile
+        if [ $BYTES_RECEIVED -ge 1073741824 ]; then
+          SIZE_HR=$(awk "BEGIN {printf \"%.2f GB\", $BYTES_RECEIVED/1073741824}")
+        elif [ $BYTES_RECEIVED -ge 1048576 ]; then
+          SIZE_HR=$(awk "BEGIN {printf \"%.2f MB\", $BYTES_RECEIVED/1048576}")
+        elif [ $BYTES_RECEIVED -ge 1024 ]; then
+          SIZE_HR=$(awk "BEGIN {printf \"%.2f KB\", $BYTES_RECEIVED/1024}")
+        else
+          SIZE_HR="$BYTES_RECEIVED B"
+        fi
+        
+        log "Transfer complete: $SIZE_HR ($BYTES_RECEIVED bytes)"
+        log "Total: $(cat /tmp/total_bytes) bytes across $CONNS connections"
+      fi
+      
+      log "Connection closed, restarting listener..."
+    done
+
+  metrics-server.sh: |
+    #!/bin/sh
+    # Simple HTTP server per esporre metriche (porta 9998)
+    
+    while true; do
+      TOTAL_BYTES=$(cat /tmp/total_bytes 2>/dev/null || echo 0)
+      TOTAL_CONNS=$(cat /tmp/total_connections 2>/dev/null || echo 0)
+      
+      RESPONSE="HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+      RESPONSE="${RESPONSE}# CloudContinuum Data Sink Metrics\n"
+      RESPONSE="${RESPONSE}data_sink_bytes_received_total $TOTAL_BYTES\n"
+      RESPONSE="${RESPONSE}data_sink_connections_total $TOTAL_CONNS\n"
+      
+      echo -e "$RESPONSE" | nc -l -p 9998 -q 1 > /dev/null 2>&1
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-sink
+  namespace: cloudcontinuum-system
+  labels:
+    app: data-sink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-sink
+  template:
+    metadata:
+      labels:
+        app: data-sink
+    spec:
+      containers:
+        # Container principale: riceve i dati
+        - name: sink
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/sink-server.sh"]
+          ports:
+            - containerPort: 9999
+              protocol: TCP
+              name: data
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: shared-data
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+        
+        # Container per metriche HTTP
+        - name: metrics
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/metrics-server.sh"]
+          ports:
+            - containerPort: 9998
+              protocol: TCP
+              name: metrics
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: shared-data
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      
+      volumes:
+        - name: scripts
+          configMap:
+            name: data-sink-scripts
+            defaultMode: 0755
+        - name: shared-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-sink
+  namespace: cloudcontinuum-system
+  labels:
+    app: data-sink
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9999
+      targetPort: 9999
+      protocol: TCP
+      name: data
+    - port: 9998
+      targetPort: 9998
+      protocol: TCP
+      name: metrics
+  selector:
+    app: data-sink
+---
+# ServiceExport per Submariner
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: data-sink
+  namespace: cloudcontinuum-system

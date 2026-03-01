@@ -82,21 +82,21 @@ func loadConfigFromConfigMap(ctx context.Context, k8sClient client.Client) (*Tra
 func getDefaultConfig() *TransferConfig {
 	return &TransferConfig{
 		bandwidthMatrix: map[string]float64{
-			// Cloud ↔ Edge: 100 MB/s
-			"cloud_cluster-edge_cluster_1": 100,
-			"edge_cluster_1-cloud_cluster": 100,
-			"cloud_cluster-edge_cluster_2": 100,
-			"edge_cluster_2-cloud_cluster": 100,
-			"cloud_cluster-edge_cluster_3": 100,
-			"edge_cluster_3-cloud_cluster": 100,
+			// Cloud ↔ Edge: 50 MB/s
+			"cloud_cluster-edge_cluster_1": 50,
+			"edge_cluster_1-cloud_cluster": 50,
+			"cloud_cluster-edge_cluster_2": 50,
+			"edge_cluster_2-cloud_cluster": 50,
+			"cloud_cluster-edge_cluster_3": 50,
+			"edge_cluster_3-cloud_cluster": 50,
 
-			// Edge ↔ Edge: 50 MB/s
-			"edge_cluster_1-edge_cluster_2": 50,
-			"edge_cluster_2-edge_cluster_1": 50,
-			"edge_cluster_1-edge_cluster_3": 50,
-			"edge_cluster_3-edge_cluster_1": 50,
-			"edge_cluster_2-edge_cluster_3": 50,
-			"edge_cluster_3-edge_cluster_2": 50,
+			// Edge ↔ Edge: 100 MB/s
+			"edge_cluster_1-edge_cluster_2": 100,
+			"edge_cluster_2-edge_cluster_1": 100,
+			"edge_cluster_1-edge_cluster_3": 100,
+			"edge_cluster_3-edge_cluster_1": 100,
+			"edge_cluster_2-edge_cluster_3": 100,
+			"edge_cluster_3-edge_cluster_2": 100,
 		},
 		defaultBandwidth: defaultBandwidth,
 	}
